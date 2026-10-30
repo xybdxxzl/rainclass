@@ -17,23 +17,28 @@ import os
 import json
 import datetime
 import threading
+from UI.AnswerDialog import AnswerDialog
+from UI.Theme import apply_theme
     
 class MainWindow_Ui(QtCore.QObject):
     # 需要建立信号槽，解决无法在线程中修改UI值问题
     add_message_signal = QtCore.pyqtSignal(str,int)
     add_course_signal = QtCore.pyqtSignal(list,int)
     del_course_signal = QtCore.pyqtSignal(int)
+    review_answer_signal = QtCore.pyqtSignal(object)
 
     def setupUi(self, MainWindow):
         # 对象变量初始化
         self.table_index = []
         self.is_active = False
+        self.review_dialogs = set()
+        self.main_window = MainWindow
 
         MainWindow.setObjectName("MainWindow")
-        MainWindow.resize(800, 700)
+        MainWindow.resize(780, 600)
         MainWindow.setAutoFillBackground(False)
         MainWindow.setStyleSheet("background-color: rgb(255, 255, 255);")
-        MainWindow.setWindowIcon(QtGui.QIcon(resource_path("UI\\Image\\favicon.ico")))
+        MainWindow.setWindowIcon(QtGui.QIcon(resource_path("UI\\Image\\app-icon.ico")))
         self.Window = QtWidgets.QWidget(MainWindow)
         self.Window.setStyleSheet("background-color: rgb(255, 255, 255);")
         self.Window.setObjectName("Window")
@@ -57,7 +62,7 @@ class MainWindow_Ui(QtCore.QObject):
         self.label.setStyleSheet("border-radius:10px;\n"
 "")
         self.label.setText("")
-        self.label.setPixmap(QtGui.QPixmap(resource_path("UI\\Image\\NoRainClassroom.jpg")))
+        self.label.setPixmap(QtGui.QPixmap(resource_path("UI\\Image\\app-icon.png")))
         self.label.setScaledContents(True)
         self.label.setObjectName("label")
         self.horizontalLayout_3.addWidget(self.label)
@@ -158,6 +163,21 @@ class MainWindow_Ui(QtCore.QObject):
         self.add_message_signal.connect(self.add_message)
         self.add_course_signal.connect(self.add_course)
         self.del_course_signal.connect(self.del_course)
+        self.review_answer_signal.connect(self.show_answer_review)
+        QtWidgets.qApp.aboutToQuit.connect(self.cancel_reviews)
+        apply_theme(MainWindow)
+        MainWindow.resize(780, 600)
+        self.verticalLayout.setContentsMargins(20, 16, 20, 12)
+        self.verticalLayout.setSpacing(16)
+        self.label_2.setText('雨课堂助手')
+        self.label.setAlignment(QtCore.Qt.AlignCenter)
+        self.label.setPixmap(QtGui.QPixmap(resource_path('UI/Image/app-icon.png')))
+        MainWindow.setWindowTitle('雨课堂助手 · 课堂与答案')
+        self.tableWidget.setAlternatingRowColors(True)
+        self.tableWidget.setShowGrid(False)
+        self.tableWidget.verticalHeader().setDefaultSectionSize(40)
+        self.output_textarea.document().setMaximumBlockCount(1500)
+        self.statusbar.showMessage('就绪 · 答案生成后可核对、修改，倒计时结束自动提交')
 
         # 配置文件检查
         dir_route = get_config_dir()
@@ -218,9 +238,27 @@ class MainWindow_Ui(QtCore.QObject):
                 self.tableWidget.removeRow(per_model_index.row())
                 self.table_index.remove((row_count,per_model_index))
 
+    def show_answer_review(self, review):
+        if not self.is_active or review.event.is_set():
+            review.finish(cancel=True)
+            return
+        dialog = AnswerDialog(review, self.main_window)
+        self.review_dialogs.add(dialog)
+        dialog.finished.connect(lambda: self.review_dialogs.discard(dialog))
+        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        QtWidgets.QApplication.alert(self.main_window)
+
+    def cancel_reviews(self):
+        self.is_active = False
+        for dialog in list(self.review_dialogs):
+            dialog.reject()
+
     def show_config(self):
         # 展示配置对话框
-        dialog = QtWidgets.QDialog()
+        dialog = QtWidgets.QDialog(self.main_window)
         config_ui = Config_Ui()
         config_ui.setupUi(dialog)
         # 加载配置文件
@@ -230,9 +268,8 @@ class MainWindow_Ui(QtCore.QObject):
         # 刷新大模型配置部分的Widget启用状态
         config_ui.enable_llm_config()
         if dialog.exec_():
-            config_route = get_config_path()
-            with open(config_route,"r") as f:
-                self.config = json.load(f)
+            # Config_Ui 成功保存后原位更新共享配置，现有课程立即读取新设置。
+            self.add_message_signal.emit('设置已保存，后续题目将使用新配置', 0)
 
     def show_login(self, _bool=False, rtn_message=""):
         # 展示登录对话框
@@ -270,6 +307,13 @@ class MainWindow_Ui(QtCore.QObject):
         # 检查配置文件存在性及可用性
         if not os.path.exists(config_route):
             initial_data = get_initial_data()
+            legacy = os.path.join(os.environ.get('APPDATA', ''), 'RainClassroomAssistant', 'config.json')
+            if os.path.isfile(legacy):
+                try:
+                    with open(legacy, 'r', encoding='utf-8-sig') as old:
+                        initial_data.update(json.load(old))
+                except (OSError, ValueError):
+                    pass
             f = open(config_route,"w+")
             json.dump(initial_data,f)
             f.close()
@@ -303,7 +347,7 @@ class MainWindow_Ui(QtCore.QObject):
     def add_message(self, message, type=0):
         # 新增输出信息，并尝试语音播报
         time = datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S] ")
-        self.output_textarea.append(time + message)
+        self.output_textarea.append(__import__('html').escape(time + message))
         if not type == 0:
             self.audio(message,type)
 
@@ -316,9 +360,11 @@ class MainWindow_Ui(QtCore.QObject):
 
     def active(self):
         # 启动
+        if self.is_active:
+            return
+        self.is_active = True
         self.monitor_t = threading.Thread(target=monitor,args=(self,),daemon=True)
         self.monitor_t.start()
-        self.is_active = True
         self.active_btn.setText("停止监听")
         self.add_message_signal.emit("启动成功",0)
     
@@ -328,8 +374,13 @@ class MainWindow_Ui(QtCore.QObject):
         self.active_btn.setEnabled(False)
         # 强制刷新UI
         QtWidgets.qApp.processEvents()
-        self.is_active = False
-        self.monitor_t.join()
+        self.cancel_reviews()
+        self._finish_stop()
+
+    def _finish_stop(self):
+        if self.monitor_t.is_alive():
+            QtCore.QTimer.singleShot(200, self._finish_stop)
+            return
         self.active_btn.setEnabled(True)
         self.active_btn.setText("启动")
         self.add_message_signal.emit("停止成功",0)

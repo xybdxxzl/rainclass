@@ -1,10 +1,74 @@
 import unittest
+import requests
 from unittest.mock import Mock, patch
 
 from Scripts.LLM import _build_user_content, _download_image_b64, _parse_answer, ask_llm, strip_html
 
 
 class LLMTests(unittest.TestCase):
+    def setUp(self):
+        self.cfg = {'base_url': 'https://api.deepseek.com', 'api_key': 'test',
+                    'model': 'deepseek-chat', 'timeout': 5}
+        self.response = Mock(status_code=200)
+        self.response.json.return_value = {'choices': [{'message': {'content': '{"choices":["A"]}'}}]}
+
+    @patch('Scripts.LLM.time.sleep')
+    @patch('Scripts.LLM.requests.post')
+    def test_read_timeout_retries_and_deepseek_timeout_floor(self, post, sleep):
+        post.side_effect = [requests.ReadTimeout('slow'), self.response]
+        retry = Mock()
+        self.assertEqual(ask_llm({'body': '题目'}, 1, self.cfg, time_budget=115, on_retry=retry), ['A'])
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(post.call_args.kwargs['timeout'][1], 30)
+        retry.assert_called_once()
+        sleep.assert_called_once_with(1)
+
+    @patch('Scripts.LLM.time.sleep')
+    @patch('Scripts.LLM.requests.post')
+    def test_retry_limit(self, post, sleep):
+        post.side_effect = requests.ReadTimeout('slow')
+        with self.assertRaisesRegex(RuntimeError, '已尝试3次'):
+            ask_llm({'body': '题目'}, 1, self.cfg, time_budget=115)
+        self.assertEqual(post.call_count, 3)
+
+    @patch('Scripts.LLM.requests.post')
+    def test_auth_error_does_not_retry(self, post):
+        response = Mock(status_code=401, text='invalid API key')
+        response.raise_for_status.side_effect = requests.HTTPError('unauthorized')
+        post.return_value = response
+        with self.assertRaisesRegex(RuntimeError, 'HTTP 401'):
+            ask_llm({'body': '题目'}, 1, self.cfg)
+        post.assert_called_once()
+
+    @patch('Scripts.LLM.time.sleep')
+    @patch('Scripts.LLM.requests.post')
+    def test_server_error_retries(self, post, sleep):
+        response = Mock(status_code=503, text='busy')
+        response.raise_for_status.side_effect = requests.HTTPError('busy')
+        post.side_effect = [response, self.response]
+        self.assertEqual(ask_llm({'body': '题目'}, 1, self.cfg), ['A'])
+        response.close.assert_called_once()
+
+    @patch('Scripts.LLM.time.monotonic', side_effect=[100, 100, 100, 102])
+    @patch('Scripts.LLM.requests.post', side_effect=requests.ReadTimeout('slow'))
+    def test_exhausted_budget_stops_retry(self, post, monotonic):
+        with self.assertRaisesRegex(RuntimeError, '已尝试1次'):
+            ask_llm({'body': '题目'}, 1, self.cfg, time_budget=2)
+        post.assert_called_once()
+
+    @patch('Scripts.LLM.requests.post')
+    def test_expired_question_does_not_request(self, post):
+        with self.assertRaisesRegex(RuntimeError, '预算已耗尽'):
+            ask_llm({'body': '题目'}, 1, self.cfg, time_budget=0)
+        post.assert_not_called()
+
+    @patch('Scripts.LLM.time.monotonic', side_effect=[100, 100, 104])
+    @patch('Scripts.LLM.requests.post')
+    def test_late_answer_is_rejected(self, post, monotonic):
+        post.return_value = self.response
+        with self.assertRaisesRegex(RuntimeError, '超过作答时间预算'):
+            ask_llm({'body': '题目'}, 1, self.cfg, time_budget=3)
+
     def test_html_images_and_linebreaks(self):
         text, images = strip_html('<P>第一行<br>第二行</P><IMG data-src="//cdn/a.png?a=1&amp;b=2">')
         self.assertEqual(text, '第一行\n第二行')

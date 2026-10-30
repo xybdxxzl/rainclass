@@ -5,6 +5,7 @@ import websocket
 import json
 from Scripts.Utils import get_user_info, dict_result, calculate_waittime
 from Scripts.LLM import ask_llm
+from Scripts.AnswerReview import AnswerReview, review_seconds
 
 wss_url = "wss://www.yuketang.cn/wsapp/"
 class Lesson:
@@ -72,7 +73,7 @@ class Lesson:
             "images": pick("images") or [],
         }
 
-    def answer_questions(self,problemid,problemtype,answer,limit,elapsed=0):
+    def answer_questions(self,problemid,problemtype,answer,limit,elapsed=0,immediate=False):
         # 回答问题
         # elapsed: 生成答案（如请求大模型）已经消耗的时间，需要从等待时长中扣除，避免超过题目时限
         if limit != -1 and elapsed >= limit:
@@ -81,6 +82,8 @@ class Lesson:
         if answer and problemtype != 3:
             wait_time = calculate_waittime(limit, self.config["answer_config"]["answer_delay"]["type"], self.config["answer_config"]["answer_delay"]["custom"]["time"])
             wait_time = max(0,wait_time - int(elapsed))
+            if immediate:
+                wait_time = 0
             if wait_time != 0:
                 meg = "%s检测到问题，将在%s秒后自动回答，答案为%s" % (self.lessonname,wait_time,answer)
                 # threading.Thread(target=say_something,args=(meg,)).start()
@@ -91,8 +94,13 @@ class Lesson:
                 self.add_message(meg,3)
                 # threading.Thread(target=say_something,args=(meg,)).start()
             data = {"problemId":problemid,"problemType":problemtype,"dt":int(time.time()),"result":answer}
-            r = requests.post(url="https://www.yuketang.cn/api/v3/lesson/problem/answer",headers=self.headers,data=json.dumps(data),proxies={"http": None,"https":None})
-            return_dict = dict_result(r.text)
+            try:
+                r = requests.post(url="https://www.yuketang.cn/api/v3/lesson/problem/answer",headers=self.headers,data=json.dumps(data),proxies={"http": None,"https":None}, timeout=10)
+                r.raise_for_status()
+                return_dict = dict_result(r.text)
+            except (requests.RequestException, ValueError) as e:
+                self.add_message('%s提交结果未确认：%s，请到雨课堂核对，程序不会重复提交' % (self.lessonname, e), 4)
+                return False
             if return_dict["code"] == 0:
                 meg = "%s自动回答成功" % self.lessonname
                 self.add_message(meg,4)
@@ -214,12 +222,14 @@ class Lesson:
                 meg = "%s检测到已过期的题目，已忽略" % (self.lessonname)
                 self.add_message(meg,0)
 
-    def _llm_fallback_hint(self, limit):
+    def _llm_fallback_hint(self, limit, elapsed=0):
         # 找不到答案时的原有提示
         if limit == -1:
             meg = "%s的问题没有找到答案，该题不限时，请尽快前往雨课堂回答" % (self.lessonname)
+        elif limit <= elapsed:
+            meg = "%s题目已超时，未提交答案，请前往雨课堂查看" % self.lessonname
         else:
-            meg = "%s的问题没有找到答案，请在%s秒内前往雨课堂回答" % (self.lessonname,limit)
+            meg = "%s的问题没有找到答案，请在%s秒内前往雨课堂回答" % (self.lessonname,max(0, int(limit - elapsed)))
         self.add_message(meg,4)
 
     def _answer_by_llm(self, problem, problemid, problemtype, limit):
@@ -230,23 +240,42 @@ class Lesson:
             return
         meg = "%s检测到问题，正在请求大模型作答" % self.lessonname
         self.add_message(meg,3)
-        start = time.time()
+        start = time.monotonic()
         try:
-            answers = ask_llm(problem, problemtype, llm_cfg)
+            answers = ask_llm(
+                problem, problemtype, llm_cfg,
+                time_budget=max(0, limit - 5) if limit != -1 else None,
+                on_retry=lambda message: self.add_message("%s：%s" % (self.lessonname, message), 0))
         except Exception as e:
             meg = "%s大模型请求失败：%s" % (self.lessonname, e)
             self.add_message(meg,4)
-            self._llm_fallback_hint(limit)
+            self._llm_fallback_hint(limit, elapsed=time.monotonic() - start)
             return
-        elapsed = time.time() - start
+        elapsed = time.monotonic() - start
         if answers:
             meg = "%s大模型给出的答案为：%s" % (self.lessonname, answers)
             self.add_message(meg,4)
-            self.answer_questions(problemid, problemtype, answers, limit, elapsed=elapsed)
+            seconds = review_seconds(limit, elapsed, self.config.get('answer_review_seconds', 15))
+            if not self.main_ui.is_active or seconds <= 0:
+                self.add_message('%s已停止监听或剩余时间不足，未提交答案' % self.lessonname, 4)
+                return
+            review = AnswerReview(self.lessonname, problem, problemtype, answers, seconds)
+            self.main_ui.review_answer_signal.emit(review)
+            # 线程只等候数据，不操作窗口。GUI繁忙时仍可在截止前提交最近有效答案。
+            while not review.event.is_set() and not review.event.wait(min(0.1, max(0, review.deadline - time.monotonic()))):
+                if not self.main_ui.is_active:
+                    review.finish(cancel=True)
+                elif time.monotonic() >= review.deadline:
+                    review.finish()
+            if review.cancelled or not self.main_ui.is_active:
+                self.add_message('%s本题已取消提交' % self.lessonname, 4)
+                return
+            self.answer_questions(problemid, problemtype, review.answers, limit,
+                                  elapsed=time.monotonic() - start, immediate=True)
         else:
             meg = "%s大模型未能解析出有效答案" % self.lessonname
             self.add_message(meg,4)
-            self._llm_fallback_hint(limit)
+            self._llm_fallback_hint(limit, elapsed=elapsed)
 
     def start_answer(self, problemid, limit, problem=None):
         if problemid is None:

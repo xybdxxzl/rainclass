@@ -21,7 +21,7 @@ class Login_Ui(object):
         Dialog.setObjectName("Dialog")
         Dialog.resize(350, 500)
         Dialog.setStyleSheet("background-color: rgb(255, 255, 255);")
-        Dialog.setWindowIcon(QtGui.QIcon(resource_path("UI\\Image\\favicon.ico")))
+        Dialog.setWindowIcon(QtGui.QIcon(resource_path("UI\\Image\\app-icon.ico")))
         self.verticalLayout = QtWidgets.QVBoxLayout(Dialog)
         self.verticalLayout.setObjectName("verticalLayout")
         self.widget = QtWidgets.QWidget(Dialog)

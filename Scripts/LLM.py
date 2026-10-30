@@ -1,6 +1,7 @@
 import re
 import json
 import base64
+import time
 import requests
 import urllib3
 from html import unescape
@@ -60,14 +61,17 @@ def strip_html(html_text):
     return "".join(parser.text).strip(), parser.images
 
 
-def _download_image_b64(url):
+def _download_image_b64(url, deadline=None):
     # 内嵌图片无需下载；相对链接以雨课堂为基准。
     url = unescape(url).strip()
     if url.startswith("data:image/"):
         return url
     url = urljoin("https://www.yuketang.cn/", url)
     try:
-        r = requests.get(url, timeout=15, proxies={"http": None, "https": None}, verify=VERIFY_SSL)
+        remaining = deadline - time.monotonic() if deadline is not None else 15
+        if remaining <= 0:
+            raise RuntimeError("大模型作答时间预算已耗尽")
+        r = requests.get(url, timeout=min(15, remaining), proxies={"http": None, "https": None}, verify=VERIFY_SSL)
         if r.status_code == 200:
             content_type = r.headers.get("Content-Type", "image/jpeg").split(";")[0].lower()
             if not r.content or not content_type.startswith("image/"):
@@ -86,7 +90,7 @@ def _as_list(value):
     return value if isinstance(value, list) else [value]
 
 
-def _build_user_content(problem, problemtype):
+def _build_user_content(problem, problemtype, deadline=None):
     # 组装发送给大模型的用户消息（文本+图片）
     # 题面字段名以课件结构为准，这里再做一次兜底，兼容WS推送里可能出现的别名
     body_text, imgs = strip_html(problem.get("body") or problem.get("content") or problem.get("title") or "")
@@ -125,7 +129,7 @@ def _build_user_content(problem, problemtype):
         if (label, url) in seen:
             continue
         seen.add((label, url))
-        b64 = _download_image_b64(url)
+        b64 = _download_image_b64(url, deadline=deadline)
         if not b64:
             raise RuntimeError("%s加载失败，请检查图片链接或在雨课堂查看原题" % label)
         content.append({"type": "text", "text": label})
@@ -160,7 +164,7 @@ def _parse_answer(content, problemtype):
     return None
 
 
-def ask_llm(problem, problemtype, llm_cfg):
+def ask_llm(problem, problemtype, llm_cfg, time_budget=None, on_retry=None):
     """
     调用大模型API回答问题。
     成功返回答案列表（选择题/填空题/简答题），失败返回None。
@@ -187,27 +191,54 @@ def ask_llm(problem, problemtype, llm_cfg):
         # 题面为空，发出去也没法作答，不浪费一次请求
         return None
 
+    # 图片下载、请求和重试共享预算，课堂调用方另行预留提交时间。
+    timeout = max(1, float(llm_cfg.get("timeout", 30)))
+    if urljoin(base_url + "/", "/").lower() == "https://api.deepseek.com/":
+        timeout = max(30, timeout)
+    budget = max(0, float(time_budget)) if time_budget is not None else timeout * 3 + 3
+    deadline = time.monotonic() + budget
+    if budget <= 0:
+        raise RuntimeError("大模型作答时间预算已耗尽")
     payload = {
         "model": model,
         "temperature": 0,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": _build_user_content(problem, problemtype)},
+            {"role": "user", "content": _build_user_content(problem, problemtype, deadline=deadline)},
         ],
     }
-    try:
-        # 注意：题目图片在_build_user_content中下载，不受此处timeout覆盖
-        r = requests.post(
-            base_url + "/chat/completions",
-            headers={"Authorization": "Bearer %s" % api_key},
-            json=payload,
-            timeout=int(llm_cfg.get("timeout", 30)),
-            proxies={"http": None, "https": None},
-            verify=VERIFY_SSL,
-        )
-        r.raise_for_status()
-    except requests.RequestException as e:
-        raise RuntimeError("请求大模型接口失败：%s" % e)
+    for attempt in range(3):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("大模型作答时间预算已耗尽")
+        r = None
+        try:
+            r = requests.post(
+                base_url + "/chat/completions",
+                headers={"Authorization": "Bearer %s" % api_key},
+                json=payload,
+                timeout=(min(10, remaining / 2), min(timeout, remaining / 2)),
+                proxies={"http": None, "https": None},
+                verify=VERIFY_SSL,
+            )
+            r.raise_for_status()
+            break
+        except requests.RequestException as e:
+            transient = isinstance(e, (requests.Timeout, requests.ConnectionError)) or (
+                r is not None and r.status_code in (429, 500, 502, 503, 504))
+            delay = attempt + 1
+            remaining = deadline - time.monotonic()
+            detail = "HTTP %s：%s" % (r.status_code, r.text[:300]) if r is not None else str(e)
+            if not transient or attempt == 2 or remaining <= delay + 1:
+                raise RuntimeError("请求大模型接口失败（已尝试%d次）：%s" % (attempt + 1, detail)) from e
+            if on_retry:
+                on_retry("大模型请求暂时失败，%s秒后重试（第%d/3次，剩余约%d秒）" % (
+                    delay, attempt + 2, remaining))
+            if r is not None:
+                r.close()
+            time.sleep(delay)
+    if time.monotonic() >= deadline:
+        raise RuntimeError("大模型响应超过作答时间预算，未采用答案")
     try:
         content = r.json()["choices"][0]["message"]["content"]
     except (KeyError, IndexError, ValueError):

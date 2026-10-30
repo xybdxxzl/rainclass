@@ -79,6 +79,7 @@ def get_initial_data():
             }
         },
         "auto_answer":True,
+        "answer_review_seconds":15,
         "answer_config":{
             "answer_delay":{
                 "type":1,
@@ -89,9 +90,9 @@ def get_initial_data():
         },
         "llm_config":{
             "enabled":False,
-            "base_url":"https://api.openai.com/v1",
+            "base_url":"https://api.deepseek.com",
             "api_key":"",
-            "model":"gpt-4o",
+            "model":"deepseek-flash",
             "timeout":30
         }
     }
@@ -104,8 +105,8 @@ def get_config_path():
 
 def get_config_dir():
     # 获取配置文件所在文件夹
-    appdata_route = os.environ['APPDATA']
-    dir_route = appdata_route + "\\RainClassroomAssistant"
+    # 配置归属于当前项目；首次启动可读取旧配置，之后仅保存到项目目录。
+    dir_route = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
     return dir_route
 
 def get_user_info(sessionid):

@@ -5,3 +5,8 @@ build
 RainClassroomAssistant.spec
 build.cmd
 .test-deps/
+.venv/
+data/
+*.bak-*
+.backups/
+previews/
