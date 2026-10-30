@@ -13,7 +13,9 @@ class DeadlineTests(unittest.TestCase):
         methods = [node for cls in tree.body if isinstance(cls, ast.ClassDef)
                    for node in cls.body if isinstance(node, ast.FunctionDef)
                    and node.name in ('_answer_by_llm', '_llm_fallback_hint')]
-        namespace = {'time': Mock(), 'ask_llm': Mock(return_value=['A'])}
+        namespace = {'time': Mock(), 'ask_llm': Mock(return_value=['A']),
+                     'route_config': lambda problem, config: config, 'random': Mock()}
+        namespace['random'].randint.side_effect = lambda a,b: a
         exec(compile(ast.Module(body=methods, type_ignores=[]), str(source), 'exec'), namespace)
         self.ns = namespace
         self.lesson = type('Lesson', (), {name: namespace[name] for name in

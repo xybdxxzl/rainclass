@@ -13,6 +13,7 @@ class SubmissionTests(unittest.TestCase):
         self.lesson.lessonname = '课程'
         self.lesson.headers = {}
         self.lesson.add_message = Mock()
+        self.lesson.main_ui = Mock()
 
     @patch('Scripts.Classes.time.sleep')
     @patch('Scripts.Classes.requests.post')

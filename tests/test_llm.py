@@ -62,7 +62,7 @@ class LLMTests(unittest.TestCase):
             ask_llm({'body': '题目'}, 1, self.cfg, time_budget=0)
         post.assert_not_called()
 
-    @patch('Scripts.LLM.time.monotonic', side_effect=[100, 100, 104])
+    @patch('Scripts.LLM.time.monotonic', side_effect=[100, 100, 100, 104])
     @patch('Scripts.LLM.requests.post')
     def test_late_answer_is_rejected(self, post, monotonic):
         post.return_value = self.response

@@ -118,6 +118,11 @@ class Config_Ui:
         self.advanced_toggle.setCheckable(True)
         fields.addWidget(self.advanced_toggle)
         self.advanced, advanced = self.container(fields)
+        self.structured_mode = QtWidgets.QComboBox()
+        for text, value in (('自动（按服务商适配）','auto'), ('严格 JSON Schema（需模型支持）','schema'),
+                            ('JSON Object（需接口支持）','json'), ('仅使用提示词','prompt')):
+            self.structured_mode.addItem(text, value)
+        self.field(advanced, '结构化输出模式', self.structured_mode)
         self.llm_base_url_input = QtWidgets.QLineEdit()
         self.llm_base_url_input.setPlaceholderText('https://api.example.com/v1')
         self.llm_base_url_input.setClearButtonEnabled(True)
@@ -126,6 +131,31 @@ class Config_Ui:
         self.llm_timeout_input = self.spin(5, 600, ' 秒')
         self.field(advanced, '单次请求超时', self.llm_timeout_input)
         advanced.addWidget(self.hint('推荐 30 秒。重试受题目剩余时间限制；DeepSeek 至少等待 30 秒。'))
+        self.vision_model_input = QtWidgets.QLineEdit()
+        self.vision_model_input.setPlaceholderText('留空使用当前模型（必须支持图片输入）')
+        self.field(advanced, '图片题模型（同一服务商）', self.vision_model_input)
+        self.alternate_models_input = QtWidgets.QLineEdit()
+        self.alternate_models_input.setPlaceholderText('可选：用英文逗号分隔，如 model-a, model-b')
+        self.field(advanced, '顶部可切换的模型', self.alternate_models_input)
+        self.custom_prompt_input = QtWidgets.QPlainTextEdit()
+        self.custom_prompt_input.setPlaceholderText('可选：补充解题要求，系统会保留 JSON 输出约束')
+        self.custom_prompt_input.setMaximumHeight(90)
+        self.field(advanced, '自定义提示词', self.custom_prompt_input)
+        self.pricing_on = QtWidgets.QCheckBox('设置费用估算单价（元 / 百万 Token）')
+        advanced.addWidget(self.pricing_on)
+        price_row = QtWidgets.QHBoxLayout()
+        self.price_inputs = []
+        for label in ('输入', '缓存输入', '输出'):
+            column = QtWidgets.QVBoxLayout()
+            price = QtWidgets.QDoubleSpinBox()
+            price.setRange(0, 100000)
+            price.setDecimals(4)
+            column.addWidget(QtWidgets.QLabel(label))
+            column.addWidget(price)
+            price_row.addLayout(column)
+            self.price_inputs.append(price)
+        advanced.addLayout(price_row)
+        self.pricing_on.toggled.connect(lambda on: [price.setEnabled(on) for price in self.price_inputs])
         self.advanced.hide()
         self.advanced_toggle.toggled.connect(self.toggle_advanced)
         self.llm_config = self.when_llm_on
@@ -133,16 +163,18 @@ class Config_Ui:
         models.addStretch()
 
         layout = self.card(answers, '答案核对', '先看答案，再决定是否修改或立即提交。')
-        self.answer_on = QtWidgets.QCheckBox('启用自动答题与答案弹窗')
+        self.answer_on = QtWidgets.QCheckBox('启用模型答题与答案核对')
         layout.addWidget(self.answer_on)
         self.when_answer_on, fields = self.container(layout)
         self.review_seconds_input = self.spin(1, 300, ' 秒')
-        self.field(fields, '核对倒计时', self.review_seconds_input)
-        fields.addWidget(self.hint('从答案生成后开始计时。到时提交最近的有效答案；临近截止会缩短核对时间，并预留 5 秒提交。'))
+        self.field(fields, '自动提交延迟下限', self.review_seconds_input)
+        self.review_max_input = self.spin(1, 300, ' 秒')
+        self.field(fields, '自动提交延迟上限', self.review_max_input)
+        fields.addWidget(self.hint('开启自动提交时，从答案生成后在区间内随机计时；临近截止会缩短等待并预留 5 秒提交。'))
         self.answer_hint = self.hint('')
         layout.addWidget(self.answer_hint)
         layout = self.card(answers, '提交方式')
-        for text in ('立即提交：提交你当前选择或编辑的答案。', '到时自动提交：无需额外点击，不再叠加随机等待。',
+        for text in ('立即提交：提交你当前选择或编辑的答案。', '自动提交：在设定的延迟区间结束后提交；可在顶部关闭。',
                      '取消本题：关闭弹窗或按 Esc，停止本题自动提交。'):
             layout.addWidget(self.hint(text))
         answers.addStretch()
@@ -205,6 +237,10 @@ class Config_Ui:
             widget.valueChanged.connect(self.mark_dirty)
             widget.setAccelerated(True)
         self.model_select.currentTextChanged.connect(self.mark_dirty)
+        self.structured_mode.currentIndexChanged.connect(self.mark_dirty)
+        self.custom_prompt_input.textChanged.connect(self.mark_dirty)
+        for price in self.price_inputs:
+            price.valueChanged.connect(self.mark_dirty)
         self.llm_api_key_input.textEdited.connect(lambda: self.set_error('key', ''))
         self.llm_model_input.textEdited.connect(lambda: self.set_error('model', ''))
         self.llm_base_url_input.textEdited.connect(lambda: self.set_error('url', ''))
@@ -289,7 +325,11 @@ class Config_Ui:
     def profile(self):
         return {'base_url': self.normalized_url(self.llm_base_url_input.text()),
                 'model': self.llm_model_input.text().strip(), 'api_key': self.llm_api_key_input.text().strip(),
-                'timeout': self.llm_timeout_input.value()}
+                'timeout': self.llm_timeout_input.value(), 'vision_model': self.vision_model_input.text().strip(),
+                'model_choices': [s.strip() for s in self.alternate_models_input.text().split(',') if s.strip()],
+                'structured_mode': self.structured_mode.currentData() or 'auto',
+                'system_prompt': self.custom_prompt_input.toPlainText().strip(),
+                'pricing': dict(enabled=self.pricing_on.isChecked(), **{key: p.value() for key, p in zip(('input','cached','output'), self.price_inputs)})}
 
     def select_provider(self, index):
         self.provider_profiles[str(self.current_provider)] = self.profile()
@@ -304,6 +344,15 @@ class Config_Ui:
         self.model_select.setEditText(profile.get('model', preset[2]))
         self.llm_api_key_input.setText(profile.get('api_key', ''))
         self.llm_timeout_input.setValue(profile.get('timeout', 30))
+        self.vision_model_input.setText(profile.get('vision_model', ''))
+        self.structured_mode.setCurrentIndex(max(0, self.structured_mode.findData(profile.get('structured_mode', 'auto'))))
+        self.alternate_models_input.setText(', '.join(profile.get('model_choices') or []))
+        self.custom_prompt_input.setPlainText(profile.get('system_prompt', ''))
+        rates = profile.get('pricing') or {}
+        self.pricing_on.setChecked(bool(rates.get('enabled')))
+        for price, key in zip(self.price_inputs, ('input', 'cached', 'output')):
+            price.setValue(float(rates.get(key, 0) or 0))
+            price.setEnabled(self.pricing_on.isChecked())
         self.provider_hint.setText(preset[3])
         self.advanced_toggle.setChecked(index == 0)
         for key in self.errors:
@@ -359,6 +408,8 @@ class Config_Ui:
             box.setChecked(data['audio_config']['audio_type'][key])
         self.answer_on.setChecked(data['auto_answer'])
         self.review_seconds_input.setValue(data['answer_review_seconds'])
+        self.review_seconds_input.setValue(data.get('answer_delay_min', data['answer_review_seconds']))
+        self.review_max_input.setValue(data.get('answer_delay_max', data['answer_review_seconds']))
         llm = data['llm_config']
         self.llm_on.setChecked(llm['enabled'])
         self.provider_profiles = copy.deepcopy(llm.get('profiles', {}))
@@ -376,6 +427,15 @@ class Config_Ui:
         self.llm_api_key_input.setText(llm['api_key'])
         self.show_key.setChecked(False)
         self.llm_timeout_input.setValue(llm['timeout'])
+        self.vision_model_input.setText(llm.get('vision_model', ''))
+        self.structured_mode.setCurrentIndex(max(0, self.structured_mode.findData(llm.get('structured_mode', 'auto'))))
+        self.alternate_models_input.setText(', '.join(llm.get('model_choices') or []))
+        self.custom_prompt_input.setPlainText(llm.get('system_prompt', ''))
+        rates = llm.get('pricing') or {}
+        self.pricing_on.setChecked(bool(rates.get('enabled', False)))
+        for price, key in zip(self.price_inputs, ('input', 'cached', 'output')):
+            price.setValue(float(rates.get(key, 0) or 0))
+            price.setEnabled(self.pricing_on.isChecked())
         self.provider_hint.setText(PRESETS[index][3])
         self.advanced_toggle.setChecked(index == 0)
         self.enable_llm_config()
@@ -397,6 +457,10 @@ class Config_Ui:
     def validate(self):
         for key in self.errors:
             self.set_error(key, '')
+        if self.review_seconds_input.value() > self.review_max_input.value():
+            self.tabs.setCurrentIndex(1)
+            self.status.setText('尚未保存：自动提交延迟下限不能大于上限')
+            return False
         if not self.llm_on.isChecked():
             return True
         profile = self.profile()
@@ -439,8 +503,13 @@ class Config_Ui:
         config['audio_config']['audio_type'].update({key: box.isChecked() for key, box in self.audio_fields.items()})
         config['auto_answer'] = self.answer_on.isChecked()
         config['answer_review_seconds'] = self.review_seconds_input.value()
+        config['answer_delay_min'] = self.review_seconds_input.value()
+        config['answer_delay_max'] = self.review_max_input.value()
         llm = config['llm_config']
         llm.update(self.profile())
+        llm['vision_model'] = self.vision_model_input.text().strip()
+        llm['system_prompt'] = self.custom_prompt_input.toPlainText().strip()
+        llm['pricing'] = dict(enabled=self.pricing_on.isChecked(), **{key: p.value() for key, p in zip(('input','cached','output'),self.price_inputs)})
         llm['enabled'] = self.llm_on.isChecked()
         profiles = copy.deepcopy(self.provider_profiles)
         profiles[str(self.current_provider)] = self.profile()

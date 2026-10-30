@@ -43,6 +43,7 @@ class SettingsTests(unittest.TestCase):
         self.ui.llm_api_key_input.setText('new-key')
         self.ui.provider_select.setCurrentIndex(4)
         self.ui.review_seconds_input.setValue(28)
+        self.ui.review_max_input.setValue(28)
         self.ui.cancel.click()
         self.assertEqual(self.config, before)
 
@@ -52,6 +53,7 @@ class SettingsTests(unittest.TestCase):
         self.ui.llm_base_url_input.setText(' https://api.deepseek.com/chat/completions/ ')
         self.ui.llm_api_key_input.setText(' test-key ')
         self.ui.review_seconds_input.setValue(28)
+        self.ui.review_max_input.setValue(28)
         with tempfile.TemporaryDirectory() as folder:
             target = Path(folder) / 'data' / 'config.json'
             with patch('UI.Config.get_config_path', return_value=str(target)):

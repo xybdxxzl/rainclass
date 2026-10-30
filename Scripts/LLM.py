@@ -6,7 +6,7 @@ import requests
 import urllib3
 from html import unescape
 from html.parser import HTMLParser
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 # 开启抓包工具/代理时证书校验常会失败，统一忽略SSL校验并压制告警
 VERIFY_SSL = False
@@ -27,7 +27,23 @@ SYSTEM_PROMPT = (
     '- 填空题：按空的顺序输出 {"blanks":["空1答案","空2答案"]}\n'
     '- 简答题：输出 {"answer":"完整答案"}，用简洁中文分点回答，必要时给出推导过程\n'
     "如果题目附有图片，请结合图片内容作答。"
+    "另外添加 question_type（题型文字）、confidence（0至1的自评数值，无法判断时为null）、"
+    "explanation（100字以内的简短解析）。置信度不是经过校准的准确率。"
 )
+
+RESULT_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'question_type': {'type': 'string'},
+        'choices': {'type': 'array', 'items': {'type': 'string'}},
+        'blanks': {'type': 'array', 'items': {'type': 'string'}},
+        'answer': {'type': 'string'},
+        'confidence': {'type': ['number', 'null']},
+        'explanation': {'type': 'string'},
+    },
+    'required': ['question_type', 'choices', 'blanks', 'answer', 'confidence', 'explanation'],
+    'additionalProperties': False,
+}
 
 
 class _QuestionHTML(HTMLParser):
@@ -88,6 +104,27 @@ def _as_list(value):
     if not value:
         return []
     return value if isinstance(value, list) else [value]
+
+
+def has_images(problem):
+    if _as_list(problem.get('images')) or strip_html(problem.get('body') or problem.get('content') or problem.get('title') or '')[1]:
+        return True
+    for option in _as_list(problem.get('options')):
+        if isinstance(option, dict):
+            if _as_list(option.get('images')) or strip_html(option.get('value') or option.get('content') or '')[1]:
+                return True
+        elif strip_html(option)[1]:
+            return True
+    return False
+
+
+def route_config(problem, config):
+    selected = dict(config)
+    if has_images(problem) and config.get('vision_model', '').strip():
+        selected['model'] = config['vision_model'].strip()
+        if selected['model'] != config.get('model'):
+            selected['pricing'] = {}
+    return selected
 
 
 def _build_user_content(problem, problemtype, deadline=None):
@@ -164,7 +201,42 @@ def _parse_answer(content, problemtype):
     return None
 
 
-def ask_llm(problem, problemtype, llm_cfg, time_budget=None, on_retry=None):
+def parse_result(content, problemtype, problem):
+    """解析并验证结果；不可信答案绝不进入提交路径。"""
+    answers = _parse_answer(content, problemtype)
+    if not answers:
+        return None
+    m = re.search(r"\{.*\}", content, re.S)
+    try:
+        data = json.loads(m.group(0))
+    except (ValueError, AttributeError):
+        return None
+    if problemtype in (1, 2):
+        options = _as_list(problem.get('options'))
+        allowed = {str((o.get('key') or chr(65 + i)) if isinstance(o, dict) else chr(65+i)).upper()
+                   for i, o in enumerate(options)}
+        if not allowed or len(set(answers)) != len(answers) or any(a not in allowed for a in answers):
+            return None
+        if problemtype == 1 and len(answers) != 1:
+            return None
+    elif problemtype == 4:
+        blanks = _as_list(problem.get('blanks'))
+        raw = data.get('blanks')
+        if not isinstance(raw, list) or any(x is None or isinstance(x, (dict,list,bool)) for x in raw):
+            return None
+        if (blanks and len(answers) != len(blanks)) or any(not str(x).strip() for x in answers):
+            return None
+    confidence = data.get('confidence')
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
+        confidence = None
+    explanation = data.get('explanation', '')
+    if not isinstance(explanation, str):
+        explanation = ''
+    return {'answers': answers, 'question_type': TYPE_DESC.get(problemtype, str(problemtype)),
+            'confidence': confidence, 'explanation': explanation.strip()[:100]}
+
+
+def ask_llm(problem, problemtype, llm_cfg, time_budget=None, on_retry=None, return_details=False):
     """
     调用大模型API回答问题。
     成功返回答案列表（选择题/填空题/简答题），失败返回None。
@@ -199,14 +271,24 @@ def ask_llm(problem, problemtype, llm_cfg, time_budget=None, on_retry=None):
     deadline = time.monotonic() + budget
     if budget <= 0:
         raise RuntimeError("大模型作答时间预算已耗尽")
+    user_prompt = str(llm_cfg.get('system_prompt') or '').strip()
+    prompt = SYSTEM_PROMPT + ('\n补充要求：' + user_prompt if user_prompt else '') + '\n始终按上述 JSON 格式输出。'
     payload = {
         "model": model,
         "temperature": 0,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": prompt},
             {"role": "user", "content": _build_user_content(problem, problemtype, deadline=deadline)},
         ],
     }
+    host = (urlsplit(base_url).hostname or '').lower()
+    mode = llm_cfg.get('structured_mode', 'auto')
+    if mode == 'schema':
+        payload['response_format'] = {'type':'json_schema','json_schema':{
+            'name':'classroom_answer','strict':True,'schema':RESULT_SCHEMA}}
+    elif mode == 'json' or (mode == 'auto' and (host == 'api.deepseek.com' or host.endswith('.aliyuncs.com'))):
+        payload['response_format'] = {'type': 'json_object'}
+    started = time.monotonic()
     for attempt in range(3):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -240,8 +322,74 @@ def ask_llm(problem, problemtype, llm_cfg, time_budget=None, on_retry=None):
     if time.monotonic() >= deadline:
         raise RuntimeError("大模型响应超过作答时间预算，未采用答案")
     try:
-        content = r.json()["choices"][0]["message"]["content"]
+        response = r.json()
+        content = response["choices"][0]["message"]["content"]
     except (KeyError, IndexError, ValueError):
         # 把401/404等错误响应体带出来，便于排查（裸HTTPError没有正文）
         raise RuntimeError("大模型返回内容无法解析（HTTP %s）：%s" % (r.status_code, r.text[:300]))
-    return _parse_answer(content, problemtype)
+    if not return_details:
+        return _parse_answer(content, problemtype)
+    result = parse_result(content, problemtype, problem)
+    if result:
+        result['latency_ms'] = int((time.monotonic() - started) * 1000)
+        usage = response.get('usage')
+        result['usage'] = usage if isinstance(usage, dict) else None
+        result['model'] = model
+        result['pricing'] = llm_cfg.get('pricing') or {}
+    return result
+
+
+def stream_explanation(problem, problemtype, answers, llm_cfg, question, on_chunk):
+    """单独请求可见解题说明；不会改变题目答案或提交状态。"""
+    base = (llm_cfg.get('base_url') or '').rstrip('/')
+    if base.endswith('/chat/completions'):
+        base = base[:-len('/chat/completions')]
+    key, model = llm_cfg.get('api_key', ''), llm_cfg.get('model', '')
+    if not base or not key or not model:
+        raise RuntimeError('请先配置模型接口、模型名称和密钥')
+    content = _build_user_content(problem, problemtype, deadline=time.monotonic()+60)
+    content.append({'type': 'text', 'text': '当前参考答案：%s\n用户问题：%s' % ('、'.join(answers), question or '请详细解释这道题。')})
+    payload = {'model': model, 'stream': True, 'temperature': 0, 'max_tokens': 800,
+               'messages': [{'role':'system','content':'请给出简洁、可读的解题说明；不要更改或提交答案。'},
+                            {'role':'user','content':content}]}
+    if (urlsplit(base).hostname or '').lower() == 'api.deepseek.com':
+        payload['stream_options'] = {'include_usage': True}
+    started = time.monotonic()
+    timeout = max(1, min(600, int(llm_cfg.get('timeout', 30))))
+    if (urlsplit(base).hostname or '').lower() == 'api.deepseek.com':
+        timeout = max(30, timeout)
+    usage = None
+    seen = False
+    try:
+        with requests.post(base+'/chat/completions', headers={'Authorization':'Bearer %s' % key},
+                           json=payload, timeout=(min(10,timeout),timeout), stream=True,
+                           proxies={'http':None,'https':None}, verify=VERIFY_SSL) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if time.monotonic() - started > 120:
+                    raise RuntimeError('解析请求超过时间限制')
+                if isinstance(line, bytes):
+                    line = line.decode('utf-8', errors='replace')
+                if not line or not line.startswith('data:'):
+                    continue
+                data = line[5:].strip()
+                if data == '[DONE]':
+                    break
+                try:
+                    chunk = json.loads(data)
+                except ValueError:
+                    continue
+                if isinstance(chunk.get('usage'), dict):
+                    usage = chunk['usage']
+                choices = chunk.get('choices') or []
+                if choices:
+                    text = (choices[0].get('delta') or {}).get('content')
+                    if isinstance(text, str) and text:
+                        seen = True
+                        on_chunk(text)
+    except requests.RequestException as e:
+        raise RuntimeError('解析请求失败：%s' % e) from e
+    if not seen:
+        raise RuntimeError('接口未返回可显示的流式解析')
+    return {'model':model,'latency_ms':int((time.monotonic()-started)*1000),
+            'usage':usage,'pricing':llm_cfg.get('pricing') or {}}

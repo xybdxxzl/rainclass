@@ -84,8 +84,27 @@ class AnswerDialog(QtWidgets.QDialog):
         self.submit.setEnabled(valid)
         if valid:
             self.review.update(answers)
-        self.note.setText('倒计时结束提交当前答案；关闭窗口将取消本题。' if valid else
-                          '答案不能为空。到时将提交最近一次有效答案，请及时补全或取消本题。')
+        else:
+            self.review.mark_invalid()
+        if not self.review.auto_submit:
+            self.note.setText('自动提交已暂停；请修改后点击立即提交，或关闭窗口取消本题。' if valid else '答案不能为空；请补全或取消本题。')
+        else:
+            self.note.setText('倒计时结束提交当前答案；关闭窗口将取消本题。' if valid else
+                              '答案不能为空。到时将提交最近一次有效答案，请及时补全或取消本题。')
+
+    def set_answers(self, answers):
+        if self.choices:
+            self.button_group.setExclusive(False)
+            for key, button in self.choices:
+                button.blockSignals(True)
+                button.setChecked(key in answers)
+                button.blockSignals(False)
+            self.button_group.setExclusive(self.review.problemtype == 1)
+        else:
+            for editor, text in zip(self.editors, answers):
+                editor.blockSignals(True)
+                editor.setPlainText(str(text))
+                editor.blockSignals(False)
 
     def confirm(self):
         self.review.finish()
@@ -97,10 +116,15 @@ class AnswerDialog(QtWidgets.QDialog):
             self.timer.stop()
             self.accept()
             return
-        remaining = max(0, self.review.deadline - time.monotonic())
-        self.countdown.setText('%d 秒后自动提交' % math.ceil(remaining))
-        if remaining <= 0:
+        target = self.review.deadline if self.review.auto_submit else self.review.question_deadline
+        remaining = max(0, target - time.monotonic()) if target is not None else None
+        self.countdown.setText(('%d 秒后自动提交' if self.review.auto_submit else '手动提交 · 剩余 %d 秒') % math.ceil(remaining) if remaining is not None else '手动提交 · 不限时')
+        if not self.review.auto_submit and '自动提交已暂停' not in self.note.text():
+            self.note.setText('自动提交已暂停；请修改后点击立即提交，或关闭窗口取消本题。')
+        if remaining is not None and remaining <= 0 and self.review.auto_submit:
             self.confirm()
+        elif remaining is not None and remaining <= 0:
+            self.reject()
 
     def reject(self):
         self.review.finish(cancel=True)

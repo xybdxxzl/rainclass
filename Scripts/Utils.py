@@ -79,6 +79,7 @@ def get_initial_data():
             }
         },
         "auto_answer":True,
+        "auto_submit":True,
         "answer_review_seconds":15,
         "answer_config":{
             "answer_delay":{

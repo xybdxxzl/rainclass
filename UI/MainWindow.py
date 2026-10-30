@@ -17,8 +17,10 @@ import os
 import json
 import datetime
 import threading
+import itertools
 from UI.AnswerDialog import AnswerDialog
 from UI.Theme import apply_theme
+from UI.Workspace import Workspace
     
 class MainWindow_Ui(QtCore.QObject):
     # 需要建立信号槽，解决无法在线程中修改UI值问题
@@ -26,10 +28,13 @@ class MainWindow_Ui(QtCore.QObject):
     add_course_signal = QtCore.pyqtSignal(list,int)
     del_course_signal = QtCore.pyqtSignal(int)
     review_answer_signal = QtCore.pyqtSignal(object)
+    question_signal = QtCore.pyqtSignal(object)
+    metrics_signal = QtCore.pyqtSignal(object)
 
     def setupUi(self, MainWindow):
         # 对象变量初始化
         self.table_index = []
+        self.course_sequence = itertools.count()
         self.is_active = False
         self.review_dialogs = set()
         self.main_window = MainWindow
@@ -169,6 +174,23 @@ class MainWindow_Ui(QtCore.QObject):
         MainWindow.resize(780, 600)
         self.verticalLayout.setContentsMargins(20, 16, 20, 12)
         self.verticalLayout.setSpacing(16)
+        self.verticalLayout.removeWidget(self.Table)
+        self.verticalLayout.removeWidget(self.Output)
+        self.workspace = Workspace(self)
+        self.verticalLayout.addWidget(self.workspace, 1)
+        self.Table.setMaximumHeight(150)
+        self.Table.hide()
+        self.verticalLayout.addWidget(self.Table)
+        self.log_toggle = QtWidgets.QToolButton(self.Window)
+        self.log_toggle.setText('运行日志')
+        self.log_toggle.setCheckable(True)
+        self.log_toggle.toggled.connect(self.Output.setVisible)
+        self.verticalLayout.addWidget(self.log_toggle)
+        self.Output.setMaximumHeight(150)
+        self.Output.hide()
+        self.verticalLayout.addWidget(self.Output)
+        self.question_signal.connect(self.workspace.show_question)
+        self.metrics_signal.connect(self.workspace.update_metrics)
         self.label_2.setText('雨课堂助手')
         self.label.setAlignment(QtCore.Qt.AlignCenter)
         self.label.setPixmap(QtGui.QPixmap(resource_path('UI/Image/app-icon.png')))
@@ -183,6 +205,7 @@ class MainWindow_Ui(QtCore.QObject):
         dir_route = get_config_dir()
         config_route = get_config_path()
         self.config = self.check_config(dir_route, config_route)
+        self.workspace.load_config()
 
         self.add_message_signal.emit("当前版本：v0.0.4",0)
         self.add_message_signal.emit("初始化完成",0)
@@ -190,9 +213,13 @@ class MainWindow_Ui(QtCore.QObject):
         # 登录状态检查
         status, user_info = self.check_login()
         if status:
+            self.workspace.connection.setText('● 账号已验证')
+            self.workspace.connection.setStyleSheet('color: #23845e;')
             self.login_btn.setText("重新登录")
             self.add_message_signal.emit("登录成功，当前登录用户："+user_info["name"],0)
         else:
+            self.workspace.connection.setText('● 未登录')
+            self.workspace.connection.setStyleSheet('color: #b75b47;')
             self.show_login()
 
     def retranslateUi(self, MainWindow):
@@ -217,16 +244,18 @@ class MainWindow_Ui(QtCore.QObject):
     def add_course(self, row, row_count):
         # 添加课程
         # 注意：在非UI运行线程中调用该方法请对add_course_signal发送信号
-        self.tableWidget.insertRow(row_count)
+        visual_row = self.tableWidget.rowCount()
+        self.tableWidget.insertRow(visual_row)
         # 装填当前行各列数据
         for i in range(len(row)):
             content = QtWidgets.QTableWidgetItem(str(row[i]))
-            self.tableWidget.setItem(row_count,i,content)
+            self.tableWidget.setItem(visual_row,i,content)
 
         # 存储各行PersistentModelIndex，便于后续删除操作
         model_index = self.tableWidget.indexFromItem(content)
         per_model_index = QtCore.QPersistentModelIndex(model_index)
         self.table_index.append((row_count,per_model_index))
+        self.update_course_status()
 
     def del_course(self, index):
         # 删除课程
@@ -237,10 +266,35 @@ class MainWindow_Ui(QtCore.QObject):
             if row_count == index:
                 self.tableWidget.removeRow(per_model_index.row())
                 self.table_index.remove((row_count,per_model_index))
+                self.update_course_status()
+
+    def update_course_status(self):
+        rows = []
+        for i in range(self.tableWidget.rowCount()):
+            name, teacher = self.tableWidget.item(i,0), self.tableWidget.item(i,2)
+            if name:
+                rows.append('%s · %s' % (name.text(), teacher.text() if teacher else '教师未知'))
+        self.workspace.course.setText('课程：' + ('；'.join(rows) if rows else '暂无'))
+        self.workspace.course.setToolTip('\n'.join(rows) if rows else '暂无正在监听的课程')
 
     def show_answer_review(self, review):
         if not self.is_active or review.event.is_set():
             review.finish(cancel=True)
+            return
+        review.display_duration = max(1, (review.deadline if review.auto_submit else (review.question_deadline or review.deadline)) - __import__('time').monotonic())
+        self.workspace.add_review(review)
+        self.open_review_dialog(review)
+
+    def review_dialog_for(self, review):
+        return next((dialog for dialog in self.review_dialogs if dialog.review is review), None)
+
+    def open_review_dialog(self, review):
+        if review.event.is_set():
+            return
+        dialog = self.review_dialog_for(review)
+        if dialog:
+            dialog.raise_()
+            dialog.activateWindow()
             return
         dialog = AnswerDialog(review, self.main_window)
         self.review_dialogs.add(dialog)
@@ -270,6 +324,19 @@ class MainWindow_Ui(QtCore.QObject):
         if dialog.exec_():
             # Config_Ui 成功保存后原位更新共享配置，现有课程立即读取新设置。
             self.add_message_signal.emit('设置已保存，后续题目将使用新配置', 0)
+            self.workspace.load_config()
+
+    def save_runtime_config(self):
+        path = get_config_path()
+        output = QtCore.QSaveFile(path)
+        try:
+            if not output.open(QtCore.QIODevice.WriteOnly):
+                raise OSError('无法打开配置文件')
+            payload = json.dumps(self.config, ensure_ascii=True, indent=2).encode('utf-8')
+            if output.write(payload) != len(payload) or not output.commit():
+                raise OSError('无法写入配置文件')
+        except OSError:
+            self.add_message_signal.emit('设置保存失败，本次更改仅在当前运行中有效', 0)
 
     def show_login(self, _bool=False, rtn_message=""):
         # 展示登录对话框
@@ -294,6 +361,8 @@ class MainWindow_Ui(QtCore.QObject):
         # 再次检测登录状态
         status, user_info = self.check_login()
         if status and success:
+            self.workspace.connection.setText('● 账号已验证')
+            self.workspace.connection.setStyleSheet('color: #23845e;')
             self.add_message_signal.emit("登录成功，当前登录用户："+user_info["name"],0)
             self.login_btn.setText("重新登录")
         if not status:
@@ -348,6 +417,11 @@ class MainWindow_Ui(QtCore.QObject):
         # 新增输出信息，并尝试语音播报
         time = datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S] ")
         self.output_textarea.append(__import__('html').escape(time + message))
+        if message == '网络异常，监听中断':
+            self.workspace.connection.setText('● 网络异常')
+            self.workspace.connection.setStyleSheet('color: #b75b47;')
+        elif message == '网络已恢复，监听开始':
+            self.workspace.connection.setText('● 网络已恢复 · 账号待确认')
         if not type == 0:
             self.audio(message,type)
 
