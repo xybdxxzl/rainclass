@@ -235,23 +235,27 @@ public class LoginActivity extends Activity {
         Request request=new Request.Builder().url("https://www.yuketang.cn/api/v3/user/basic-info")
                 .header("Cookie","sessionid="+token).header("User-Agent","Mozilla/5.0").build();
         qrClient.newCall(request).enqueue(new Callback(){
-            @Override public void onFailure(Call call,IOException e){loginResult(token,false,automatic);}
+            @Override public void onFailure(Call call,IOException e){loginResult(token,false,automatic,"","");}
             @Override public void onResponse(Call call,Response response){
-                boolean ok=false;try(Response r=response){if(r.isSuccessful()&&r.body()!=null){
+                boolean ok=false;String uid="",uname="";try(Response r=response){if(r.isSuccessful()&&r.body()!=null){
                     try(InputStream in=r.body().byteStream();ByteArrayOutputStream out=new ByteArrayOutputStream()){
                         byte[] buffer=new byte[4096];int n;while((n=in.read(buffer))!=-1){if(out.size()+n>1048576)throw new IOException("response too large");out.write(buffer,0,n);}
-                        ok=new JSONObject(out.toString("UTF-8")).optInt("code",-1)==0;
+                        JSONObject result=new JSONObject(out.toString("UTF-8"));ok=result.optInt("code",-1)==0;JSONObject info=result.optJSONObject("data");if(ok&&info!=null){uid=info.optString("id","");uname=info.optString("name","");}
                     }
-                }}catch(Exception ignored){}loginResult(token,ok,automatic);
+                }}catch(Exception ignored){}loginResult(token,ok,automatic,uid,uname);
             }
         });
     }
-    private void loginResult(String token,boolean result,boolean automatic){main.post(()->{
+    private void loginResult(String token,boolean result,boolean automatic,String userId,String userName){main.post(()->{
         validating.set(false);
         if(isFinishing()||isDestroyed())return;use.setEnabled(true);manualSubmit.setEnabled(true);
         // 异步验证期间登录页可能已切换账号；过期结果不能覆盖新会话。
         if(automatic && !token.equals(extractSession(CookieManager.getInstance().getCookie("https://www.yuketang.cn/"))))return;
-        if(result){if(getSharedPreferences("rain_config",MODE_PRIVATE).edit().putString("sessionid",token).commit()){
+        if(result){
+            android.content.SharedPreferences prefs=getSharedPreferences("rain_config",MODE_PRIVATE);
+            if(!token.equals(prefs.getString("sessionid","")))stopService(new Intent(this,MonitorService.class));
+            if(prefs.edit().putString("sessionid",token).putString("user_id",userId).putString("user_name",userName)
+                .putBoolean("account_verified",true).putLong("account_verified_at",System.currentTimeMillis()).commit()){
             setResult(RESULT_OK);Toast.makeText(this,"登录成功",Toast.LENGTH_SHORT).show();finish();}
             else {exchanging.set(false);status.setText("保存失败，请检查设备存储空间。");}}
         else {exchanging.set(false);if(!automatic){status.setText("验证未成功。请确认登录状态有效，并检查手机网络。");qrStatus.setText("登录验证未成功，请刷新二维码重试。");}}

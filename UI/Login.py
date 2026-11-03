@@ -9,6 +9,7 @@
 
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+from UI.Theme import STYLE, prepare_fonts
 from Scripts.Utils import dict_result, get_config_path, resource_path
 import websocket
 import requests
@@ -18,9 +19,10 @@ import time
 
 class Login_Ui(object):
     def setupUi(self, Dialog):
+        prepare_fonts(QtWidgets.QApplication.instance())
         Dialog.setObjectName("Dialog")
         Dialog.resize(350, 500)
-        Dialog.setStyleSheet("background-color: rgb(255, 255, 255);")
+        Dialog.setStyleSheet(STYLE)
         Dialog.setWindowIcon(QtGui.QIcon(resource_path("UI\\Image\\app-icon.ico")))
         self.verticalLayout = QtWidgets.QVBoxLayout(Dialog)
         self.verticalLayout.setObjectName("verticalLayout")
@@ -32,14 +34,11 @@ class Login_Ui(object):
         self.verticalLayout_2.setObjectName("verticalLayout_2")
         self.label = QtWidgets.QLabel(self.widget)
         self.label.setLayoutDirection(QtCore.Qt.LeftToRight)
-        self.label.setStyleSheet("color: rgb(0, 0, 0);\n"
-"font: 16pt \"微软雅黑\";")
         self.label.setAlignment(QtCore.Qt.AlignCenter)
-        self.label.setObjectName("label")
+        self.label.setObjectName("loginTitle")
         self.verticalLayout_2.addWidget(self.label)
         self.label_2 = QtWidgets.QLabel(self.widget)
-        self.label_2.setStyleSheet("font: 8pt \"微软雅黑\";\n"
-"color: rgb(255, 0, 0);")
+        self.label_2.setStyleSheet("font-size: 13px; color: #9b3c29;")
         self.label_2.setTextFormat(QtCore.Qt.AutoText)
         self.label_2.setAlignment(QtCore.Qt.AlignCenter)
         self.label_2.setWordWrap(True)

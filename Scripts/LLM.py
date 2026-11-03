@@ -2,6 +2,7 @@ import re
 import json
 import base64
 import time
+import threading
 import requests
 import urllib3
 from html import unescape
@@ -267,7 +268,7 @@ def ask_llm(problem, problemtype, llm_cfg, time_budget=None, on_retry=None, retu
     timeout = max(1, float(llm_cfg.get("timeout", 30)))
     if urljoin(base_url + "/", "/").lower() == "https://api.deepseek.com/":
         timeout = max(30, timeout)
-    budget = max(0, float(time_budget)) if time_budget is not None else timeout * 3 + 3
+    budget = max(0, float(time_budget)) if time_budget is not None else max(1, float(llm_cfg.get('total_timeout', llm_cfg.get('timeout', 30))))
     deadline = time.monotonic() + budget
     if budget <= 0:
         raise RuntimeError("大模型作答时间预算已耗尽")
@@ -393,3 +394,70 @@ def stream_explanation(problem, problemtype, answers, llm_cfg, question, on_chun
         raise RuntimeError('接口未返回可显示的流式解析')
     return {'model':model,'latency_ms':int((time.monotonic()-started)*1000),
             'usage':usage,'pricing':llm_cfg.get('pricing') or {}}
+
+
+def classify_error(error):
+    """将接口错误变成可以直接展示的类别，不向界面泄露完整请求。"""
+    chain, current = [], error
+    while current is not None and current not in chain:
+        chain.append(current)
+        current = current.__cause__
+    text = str(error).lower()
+    if any(isinstance(item, requests.Timeout) for item in chain) or any(word in text for word in ('timeout', 'timed out', '超时', '预算已耗尽', '超过作答时间预算')):
+        return 'timeout', '模型请求超时，可继续手动作答或重试'
+    if '401' in text or '403' in text:
+        return 'auth', '接口鉴权失败，请检查 API Key 和权限'
+    if '404' in text:
+        return 'configuration', '接口地址或模型不可用，请检查配置'
+    if '429' in text:
+        return 'rate_limit', '服务商限流或额度不足，请稍后重试并检查账号额度'
+    if any(isinstance(item, requests.ConnectionError) for item in chain):
+        return 'network', '无法连接模型服务，请检查网络和接口地址'
+    if '图片' in text:
+        return 'image', '题目图片获取失败，请核对原图后重试'
+    if any(word in text for word in ('解析', '格式', '有效答案')):
+        return 'format', '模型返回格式异常，未获得有效答案'
+    return 'failed', '模型请求失败，请检查配置或稍后重试'
+
+
+def bounded_call(callback, seconds):
+    """为包含图片、请求及重试的完整操作设置总时限；迟到结果不会被采用。"""
+    done = threading.Event()
+    outcome = {}
+    def work():
+        try:
+            outcome['value'] = callback()
+        except Exception as error:
+            outcome['error'] = error
+        finally:
+            done.set()
+    threading.Thread(target=work, daemon=True).start()
+    if not done.wait(max(0, float(seconds))):
+        raise requests.Timeout('模型整体等待超时')
+    if 'error' in outcome:
+        raise outcome['error']
+    return outcome.get('value')
+
+
+def test_connection(config):
+    """独立最小题测试完整生成与答案解析；不会创建课堂记录或提交答案。"""
+    started = time.monotonic()
+    cfg = dict(config)
+    cfg['enabled'] = True
+    response = {'ok': False, 'status': 'configuration', 'message': '',
+                'model': cfg.get('model', ''), 'tested_at': time.time(), 'latency_ms': 0}
+    if not all(str(cfg.get(key) or '').strip() for key in ('base_url', 'api_key', 'model')):
+        response['message'] = '请填写接口地址、API Key 和模型名称'
+        return response
+    problem = {'body': '连接测试：请选择数字 1。', 'options': [{'key': 'A', 'value': '1'}, {'key': 'B', 'value': '2'}]}
+    try:
+        budget = max(1, min(600, float(cfg.get('total_timeout', cfg.get('timeout', 30)))))
+        result = bounded_call(lambda: ask_llm(problem, 1, cfg, time_budget=budget, return_details=True), budget)
+        if not result or not result.get('answers'):
+            raise RuntimeError('模型未返回有效答案，返回格式异常')
+        response.update(ok=True, status='success', message='连接成功，模型生成和答案解析均通过')
+    except Exception as error:
+        kind, message = classify_error(error)
+        response.update(status=kind, message=message)
+    response['latency_ms'] = round((time.monotonic() - started) * 1000)
+    return response

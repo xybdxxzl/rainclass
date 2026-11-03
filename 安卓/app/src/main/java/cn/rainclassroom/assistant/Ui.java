@@ -47,7 +47,7 @@ final class Ui {
         gap(a,l,10); l.addView(text(a,name,13,INK,true)); gap(a,l,5); l.addView(field,new LinearLayout.LayoutParams(-1,-2));
     }
     static void buttonGap(Activity a, LinearLayout l, View button) {
-        gap(a,l,10); l.addView(button,new LinearLayout.LayoutParams(-1,dp(a,48)));
+        gap(a,l,10); l.addView(button,new LinearLayout.LayoutParams(-1,-2));
     }
     static LinearLayout screen(Activity a, String title, String subtitle) {
         a.getWindow().setStatusBarColor(Color.rgb(244,247,252)); a.getWindow().setNavigationBarColor(Color.rgb(244,247,252));

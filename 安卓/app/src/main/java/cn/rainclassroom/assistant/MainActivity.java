@@ -27,6 +27,8 @@ public class MainActivity extends Activity {
     private final StringBuilder logs=new StringBuilder();
     private String courses="[]";
     private boolean home=true, pendingStart=false;
+    private int screenGeneration;
+    private String verifyingSession="";
     private boolean resumed=false, openingReview=false;
     private final HashSet<String> seenReviews=new HashSet<>();
     private static final String UPDATE="cn.rainclassroom.assistant.UPDATE";
@@ -47,9 +49,10 @@ public class MainActivity extends Activity {
         if(Build.VERSION.SDK_INT>=33) registerReceiver(receiver,f,Context.RECEIVER_NOT_EXPORTED); else registerReceiver(receiver,f);
     }
     @Override protected void onStop(){unregisterReceiver(receiver); super.onStop();}
-    @Override protected void onResume(){super.onResume();resumed=true;openingReview=false;courses=MonitorService.getCoursesJson();if(home)showHome();maybeOpenReview();}
+    @Override protected void onResume(){super.onResume();resumed=true;openingReview=false;courses=MonitorService.getCoursesJson();if(home)showHome();verifyAccount();maybeOpenReview();}
     @Override protected void onPause(){resumed=false;super.onPause();}
     private LinearLayout screen(String title,String subtitle){
+        screenGeneration++;
         LinearLayout root=Ui.screen(this,title,subtitle); ScrollView scroll=new ScrollView(this); scroll.setFillViewport(false); currentScroll=scroll;
         content=Ui.column(this); scroll.addView(content); root.addView(scroll,new LinearLayout.LayoutParams(-1,0,1)); setContentView(root); return root;
     }
@@ -59,9 +62,16 @@ public class MainActivity extends Activity {
         final ScrollView newScroll=currentScroll;newScroll.post(()->newScroll.scrollTo(0,oldScroll));
         LinearLayout summary=Ui.card(this); summary.addView(Ui.text(this,"课堂监听",18,Ui.INK,true)); Ui.gap(this,summary,7);
         boolean logged=!prefs.getString("sessionid","").isEmpty();
-        summary.addView(Ui.text(this,logged?(MonitorService.isRunning?"已登录 · 正在监听课堂":"已登录 · 监听未启动"):"尚未登录 · 请先登录雨课堂",13,Ui.MUTED,false));
+        String user=prefs.getString("user_name","");
+        summary.addView(Ui.text(this,"当前用户："+(user.isEmpty()?"待确认":user),16,Ui.INK,true));
+        summary.addView(Ui.text(this,!logged?"尚未登录":prefs.getBoolean("account_verified",false)?"账号已验证":"账号待验证或已失效",13,Ui.MUTED,false));
+        try{JSONObject state=new JSONObject(MonitorService.getStatusJson());
+            summary.addView(Ui.text(this,"监听状态："+(MonitorService.isRunning?state.optString("state","正在启动"):"未启动"),14,Ui.BLUE,true));
+            summary.addView(Ui.text(this,"最近课程检测："+clock(state.optLong("lastScan"))+"\n最近课堂消息："+clock(state.optLong("lastMessage"))
+                +"\n最近收到题目："+clock(state.optLong("lastQuestion"))+" · 已收 "+state.optInt("received")+" 题",12,Ui.MUTED,false));
+        }catch(Exception ignored){}
         Button login=Ui.button(this,logged?"更换登录账号":"登录雨课堂",false);
-        login.setOnClickListener(v->startActivity(new Intent(this,LoginActivity.class))); Ui.buttonGap(this,summary,login);
+        login.setOnClickListener(v->{stopService(new Intent(this,MonitorService.class));startActivity(new Intent(this,LoginActivity.class));}); Ui.buttonGap(this,summary,login);
         LinearLayout row=new LinearLayout(this); row.setOrientation(LinearLayout.HORIZONTAL);
         Button start=Ui.button(this,"开始监听",true), stop=Ui.button(this,"停止",false);
         LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(0,Ui.dp(this,48),1); p.rightMargin=Ui.dp(this,8);
@@ -72,13 +82,16 @@ public class MainActivity extends Activity {
             toast("已请求停止监听并取消待答");}catch(Exception ex){toast("停止失败，请重试");}});
         LinearLayout active=Ui.card(this);active.addView(Ui.text(this,"正在上课",18,Ui.INK,true)); Ui.gap(this,active,8);
         try {JSONArray list=new JSONArray(courses);if(list.length()==0)active.addView(Ui.text(this,"暂无课程 · 开始监听后自动刷新",13,Ui.MUTED,false));
-            for(int i=0;i<list.length();i++){JSONObject obj=list.optJSONObject(i);if(obj!=null){active.addView(Ui.text(this,obj.optString("courseName","未命名课程"),15,Ui.INK,true)); Ui.gap(this,active,6);}}}
+            for(int i=0;i<list.length();i++){JSONObject obj=list.optJSONObject(i);if(obj!=null){active.addView(Ui.text(this,obj.optString("courseName","未命名课程")+" · "+obj.optString("state","连接中"),15,Ui.INK,true)); Ui.gap(this,active,6);}}}
         catch(Exception e){active.addView(Ui.text(this,"课程列表暂不可用",13,Ui.MUTED,false));} content.addView(active);
-        LinearLayout review=Ui.card(this);review.addView(Ui.text(this,"待核对答案",18,Ui.INK,true));Ui.gap(this,review,8);
+        LinearLayout review=Ui.card(this);review.addView(Ui.text(this,"实时题目",18,Ui.INK,true));Ui.gap(this,review,8);
         java.util.List<ReviewRegistry.Review> waiting=ReviewRegistry.list();
-        if(waiting.isEmpty()) review.addView(Ui.text(this,"暂无待处理的题目",13,Ui.MUTED,false));
-        for(ReviewRegistry.Review item:waiting){Button b=Ui.button(this,item.course+" · 点击核对答案",false);String id=item.id;
+        if(waiting.isEmpty()) review.addView(Ui.text(this,"本次尚未收到待处理题目，请同时检查上方监听状态。",13,Ui.MUTED,false));
+        for(ReviewRegistry.Review item:waiting){Button b=Ui.button(this,item.course+" · 模型"+item.modelState+" · 点击作答",false);String id=item.id;
             b.setOnClickListener(v->openReview(id));Ui.buttonGap(this,review,b);} content.addView(review);
+        LinearLayout historyCard=Ui.card(this);historyCard.addView(Ui.text(this,"历史题目",18,Ui.INK,true));
+        historyCard.addView(Ui.text(this,"包含模型超时、失败和未作答的题目，保存在本机。",12,Ui.MUTED,false));
+        Button history=Ui.button(this,"查看历史题目",false);history.setOnClickListener(v->showHistory());Ui.buttonGap(this,historyCard,history);content.addView(historyCard);
         LinearLayout prefsCard=Ui.card(this);prefsCard.addView(Ui.text(this,"偏好设置",18,Ui.INK,true));
         prefsCard.addView(Ui.text(this,"设置模型、密钥和答案核对时间",13,Ui.MUTED,false));
         Button settings=Ui.button(this,"配置大模型与答题",false); settings.setOnClickListener(v->showSettings());Ui.buttonGap(this,prefsCard,settings);content.addView(prefsCard);
@@ -100,7 +113,7 @@ public class MainActivity extends Activity {
         catch(Exception e){toast("无法启动监听，请检查系统设置");}}
     private void openReview(String id){seenReviews.add(id);openingReview=true;startActivity(new Intent(this,ReviewActivity.class).putExtra("review_id",id));}
     private void maybeOpenReview(){
-        if(!resumed||openingReview||isFinishing())return;
+        if(!home||!resumed||openingReview||isFinishing())return;
         for(ReviewRegistry.Review r:ReviewRegistry.list())if(!seenReviews.contains(r.id)){openReview(r.id);return;}
     }
     private void toast(String s){Toast.makeText(this,s,Toast.LENGTH_LONG).show();}
@@ -116,12 +129,35 @@ public class MainActivity extends Activity {
         EditText model=Ui.input(this,"例如 deepseek-flash",false);Ui.field(this,card,"模型名称",model);
         EditText url=Ui.input(this,"https://...",false);Ui.field(this,card,"接口地址",url);
         card.addView(Ui.text(this,"支持完整的 /chat/completions 地址；密钥按服务商分别保存。",12,Ui.MUTED,false));
-        EditText timeout=Ui.input(this,"30",false);timeout.setInputType(InputType.TYPE_CLASS_NUMBER);Ui.field(this,card,"请求超时（秒）",timeout);
+        EditText timeout=Ui.input(this,"30",false);timeout.setInputType(InputType.TYPE_CLASS_NUMBER);Ui.field(this,card,"总等待上限（秒，含图片和重试）",timeout);
+        TextView testStatus=Ui.text(this,"未测试当前配置",12,Ui.MUTED,false);
+        Button test=Ui.button(this,"测试大模型连接",false);Ui.buttonGap(this,card,test);card.addView(testStatus);
+        final int mounted=screenGeneration;final int[] configVersion={0};
+        android.text.TextWatcher watcher=new android.text.TextWatcher(){
+            public void beforeTextChanged(CharSequence t,int st,int count,int after){}
+            public void onTextChanged(CharSequence t,int st,int before,int count){configVersion[0]++;testStatus.setText("配置已变更，请重新测试");}
+            public void afterTextChanged(android.text.Editable e){}
+        };
+        key.addTextChangedListener(watcher);model.addTextChangedListener(watcher);url.addTextChangedListener(watcher);timeout.addTextChangedListener(watcher);
+        test.setOnClickListener(v->{
+            String testUrl=url.getText().toString().trim(),testKey=key.getText().toString().trim(),testModel=model.getText().toString().trim();
+            int t=parse(timeout.getText().toString(),-1);
+            if(!validUrl(ModelClient.normalize(testUrl))||testKey.isEmpty()||testModel.isEmpty()||t<5||t>600){testStatus.setText("请先填写有效地址、密钥、模型和等待上限");return;}
+            int version=configVersion[0];test.setEnabled(false);testStatus.setText("测试中…使用当前填写的配置，最多等待 "+Math.min(30,t)+" 秒");
+            new Thread(()->{
+                long begin=android.os.SystemClock.elapsedRealtime();String result;
+                try{ModelClient.test(testUrl,testKey,testModel,t);result="测试通过 · "+testModel;}
+                catch(Exception e){result=e instanceof ModelClient.Failure?e.getMessage():e instanceof java.io.InterruptedIOException?"模型连接超时":"网络或响应异常";}
+                final String message=result+" · "+(android.os.SystemClock.elapsedRealtime()-begin)+" ms · "+clock(System.currentTimeMillis());
+                runOnUiThread(()->{if(isFinishing()||screenGeneration!=mounted)return;test.setEnabled(true);testStatus.setText(configVersion[0]==version?message:"配置已变更，刚才的测试结果已失效");});
+            },"模型连接测试").start();
+        });
         content.addView(card);
         LinearLayout reviewCard=Ui.card(this);reviewCard.addView(Ui.text(this,"答案核对",18,Ui.INK,true));
         EditText seconds=Ui.input(this,"15",false);seconds.setInputType(InputType.TYPE_CLASS_NUMBER);seconds.setText(String.valueOf(prefs.getInt("review_seconds",15)));
         Ui.field(this,reviewCard,"核对倒计时（秒）",seconds);Ui.gap(this,reviewCard,8);
-        reviewCard.addView(Ui.text(this,"答案可修改、立即提交或取消，到时自动提交。题目快到期时会缩短核对时间。",12,Ui.MUTED,false));content.addView(reviewCard);
+        Switch autoSubmit=new Switch(this);autoSubmit.setText("模型成功后允许自动提交");autoSubmit.setTextColor(Ui.INK);autoSubmit.setChecked(prefs.getBoolean("auto_submit",true));reviewCard.addView(autoSubmit);
+        reviewCard.addView(Ui.text(this,"收到题目即可手动作答。人工修改后本题暂停自动提交；题目快到期时会缩短核对时间。",12,Ui.MUTED,false));content.addView(reviewCard);
         LinearLayout danmuCard=Ui.card(this);danmuCard.addView(Ui.text(this,"课堂弹幕",18,Ui.INK,true));Ui.gap(this,danmuCard,8);
         Switch autoDanmu=new Switch(this);autoDanmu.setText("启用自动跟随弹幕");autoDanmu.setTextColor(Ui.INK);autoDanmu.setChecked(prefs.getBoolean("auto_danmu",false));danmuCard.addView(autoDanmu);
         EditText danmuLimit=Ui.input(this,"5",false);danmuLimit.setInputType(InputType.TYPE_CLASS_NUMBER);danmuLimit.setText(String.valueOf(prefs.getInt("danmu_limit",5)));
@@ -164,12 +200,83 @@ public class MainActivity extends Activity {
             drafts.put(current[0],new Profile(address,token,name,t));
             SharedPreferences.Editor edit=prefs.edit().putBoolean("auto_answer",enabled.isChecked()).putInt("provider_index",current[0])
                 .putString("base_url",address).putString("api_key",token).putString("model",name).putInt("timeout",t).putInt("review_seconds",sec);
+            edit.putBoolean("auto_submit",autoSubmit.isChecked());
+            if(!autoSubmit.isChecked())for(ReviewRegistry.Review r:ReviewRegistry.list())ReviewRegistry.touch(r.id);
             edit.putBoolean("auto_danmu",autoDanmu.isChecked()).putInt("danmu_limit",count);
             edit.putBoolean("audio_on",audioOn.isChecked());
             for(int i=0;i<NAMES.length;i++){Profile p=drafts.get(i);String prefix="provider_"+i+"_";edit.putString(prefix+"url",p.url).putString(prefix+"key",p.key).putString(prefix+"model",p.model).putInt(prefix+"timeout",p.timeout);}
             if(!edit.commit()){toast("保存失败，请检查设备存储空间");return;}toast("设置已保存");showHome();
         });
         cancel.setOnClickListener(v->showHome());
+    }
+    private static String clock(long value){return value<=0?"尚无记录":new java.text.SimpleDateFormat("HH:mm:ss",java.util.Locale.ROOT).format(new java.util.Date(value));}
+    private void verifyAccount(){
+        String token=prefs.getString("sessionid","");if(token.isEmpty()||token.equals(verifyingSession))return;
+        if(prefs.getBoolean("account_verified",false)&&System.currentTimeMillis()-prefs.getLong("account_verified_at",0)<60000)return;
+        verifyingSession=token;
+        new Thread(()->{
+            okhttp3.OkHttpClient client=new okhttp3.OkHttpClient.Builder().callTimeout(15,java.util.concurrent.TimeUnit.SECONDS).followSslRedirects(false).build();
+            boolean valid=false;JSONObject user=null;
+            try(okhttp3.Response response=client.newCall(new okhttp3.Request.Builder().url("https://www.yuketang.cn/api/v3/user/basic-info").header("Cookie","sessionid="+token).build()).execute()){
+                if(response.isSuccessful()&&response.body()!=null){JSONObject result=new JSONObject(response.body().string());valid=result.optInt("code",-1)==0;user=result.optJSONObject("data");}
+            }catch(Exception ignored){}
+            final boolean ok=valid;final JSONObject info=user;
+            runOnUiThread(()->{verifyingSession="";if(!token.equals(prefs.getString("sessionid",""))||isFinishing())return;
+                SharedPreferences.Editor e=prefs.edit().putBoolean("account_verified",ok);
+                if(ok&&info!=null)e.putString("user_id",info.optString("id","")).putString("user_name",info.optString("name","")).putLong("account_verified_at",System.currentTimeMillis());
+                e.apply();if(home)showHome();
+            });
+            client.connectionPool().evictAll();client.dispatcher().executorService().shutdown();
+        },"账号验证").start();
+    }
+    private void showHistory(){
+        home=false;screen("历史题目","按当前账号保存在本机，已结束题目仅供查看");
+        String account=prefs.getString("user_id","");
+        if(account.isEmpty()){content.addView(Ui.text(this,"请先验证登录账号后查看对应历史。",14,Ui.MUTED,false));return;}
+        LinearLayout filters=Ui.card(this);
+        EditText keyword=Ui.input(this,"搜索题干或答案",false),course=Ui.input(this,"课程名称（可留空）",false),date=Ui.input(this,"yyyy-MM-dd（可留空）",false);
+        Ui.field(this,filters,"关键词",keyword);Ui.field(this,filters,"课程",course);Ui.field(this,filters,"日期",date);
+        Spinner state=new Spinner(this);String[] labels={"全部","待作答","提交成功","提交失败","提交结果未知","已取消","已过期","已作答"};
+        state.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,labels));Ui.field(this,filters,"作答状态",state);
+        Spinner modelState=new Spinner(this);String[] modelLabels={"全部","未请求","处理中","重试中","成功","超时","失败","题面获取失败"};
+        modelState.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,modelLabels));Ui.field(this,filters,"模型状态",modelState);
+        Button search=Ui.button(this,"查询",true);Ui.buttonGap(this,filters,search);content.addView(filters);
+        LinearLayout rows=Ui.column(this);content.addView(rows);
+        Runnable query=()->{
+            rows.removeAllViews();String d=date.getText().toString().trim();
+            if(!d.isEmpty()&&!d.matches("\\d{4}-\\d{2}-\\d{2}")){rows.addView(Ui.text(this,"日期格式请输入 yyyy-MM-dd",14,Ui.MUTED,false));return;}
+            try(HistoryStore store=new HistoryStore(this)){
+                JSONArray list=store.list(account,keyword.getText().toString(),course.getText().toString(),String.valueOf(state.getSelectedItem()),d);
+                int count=0;
+                for(int i=0;i<list.length();i++){JSONObject item=list.optJSONObject(i);if(item==null)continue;
+                    String m=String.valueOf(modelState.getSelectedItem());if(!"全部".equals(m)&&!m.equals(item.optString("modelState")))continue;count++;
+                    JSONObject p=item.optJSONObject("problem");String text=p==null?"题面未获取":firstText(p);
+                    Button b=Ui.button(this,item.optString("course")+" · "+item.optString("state")+" · 模型"+item.optString("modelState")+"\n"
+                        +new java.text.SimpleDateFormat("MM-dd HH:mm",java.util.Locale.ROOT).format(new java.util.Date(item.optLong("received")))+"\n"+(text.length()>65?text.substring(0,65)+"…":text),false);
+                    b.setSingleLine(false);b.setMaxLines(5);Ui.buttonGap(this,rows,b);b.setOnClickListener(v->historyDetail(item));
+                }
+                if(count==0)rows.addView(Ui.text(this,"没有符合条件的历史题目。",14,Ui.MUTED,false));
+            }catch(Exception e){rows.addView(Ui.text(this,"历史题目读取失败，请检查存储空间。",14,Ui.MUTED,false));}
+        };
+        search.setOnClickListener(v->query.run());query.run();
+    }
+    private static String firstText(JSONObject p){
+        String text=p.optString("body","");if(text.isEmpty())text=p.optString("content","");if(text.isEmpty())text=p.optString("title","");
+        return android.text.Html.fromHtml(text,android.text.Html.FROM_HTML_MODE_COMPACT).toString().trim();
+    }
+    private void historyDetail(JSONObject item){
+        JSONObject p=item.optJSONObject("problem");StringBuilder text=new StringBuilder(item.optString("course")).append("\n接收时间：")
+            .append(new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss",java.util.Locale.ROOT).format(new java.util.Date(item.optLong("received"))))
+            .append("\n题目编号：").append(item.optString("problemId")).append("\n\n").append(p==null?"未获取到题面":firstText(p));
+        JSONArray options=p==null?null:p.optJSONArray("options");if(options!=null)for(int i=0;i<options.length();i++){
+            JSONObject o=options.optJSONObject(i);text.append("\n").append(o==null?String.valueOf((char)('A'+i)):o.optString("key",String.valueOf((char)('A'+i)))).append(". ")
+                .append(android.text.Html.fromHtml(o==null?String.valueOf(options.opt(i)):o.optString("value",o.optString("content","")),android.text.Html.FROM_HTML_MODE_COMPACT));
+        }
+        text.append("\n\n模型：").append(item.optString("modelState")).append(" · ").append(item.optLong("modelDuration")).append(" ms\n")
+            .append(item.optString("modelMessage")).append("\n模型建议：").append(item.optJSONArray("suggestions"))
+            .append("\n当前答案：").append(item.optJSONArray("answers")).append("\n提交结果：").append(item.optString("state"));
+        TextView view=Ui.text(this,text.toString(),15,Ui.INK,false);view.setTextIsSelectable(true);view.setPadding(Ui.dp(this,20),Ui.dp(this,12),Ui.dp(this,20),Ui.dp(this,12));ScrollView scroll=new ScrollView(this);scroll.addView(view);
+        new AlertDialog.Builder(this).setTitle("题目详情（只读）").setView(scroll).setPositiveButton("关闭",null).show();
     }
     private static boolean validUrl(String value){try {java.net.URI u=new java.net.URI(value);return "https".equalsIgnoreCase(u.getScheme())&&u.getHost()!=null&&u.getUserInfo()==null&&u.getQuery()==null&&u.getFragment()==null;}catch(Exception e){return false;}}
     private static int parse(String value,int fallback){try{return Integer.parseInt(value.trim());}catch(Exception e){return fallback;}}

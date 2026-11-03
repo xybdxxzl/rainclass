@@ -9,10 +9,10 @@ from UI.Config import Config_Ui
 from UI.AnswerDialog import AnswerDialog
 from Scripts.AnswerReview import AnswerReview
 from Scripts.Utils import get_initial_data
-from UI.Theme import STYLE
+from UI.Theme import STYLE, prepare_fonts
 
 app = QtWidgets.QApplication([])
-QtGui.QFontDatabase.addApplicationFont('C:/Windows/Fonts/msyh.ttc')
+prepare_fonts(app)
 app.setStyle('Fusion')
 app.setStyleSheet(STYLE)
 out = Path(__file__).parent / 'previews'

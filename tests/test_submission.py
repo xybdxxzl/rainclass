@@ -34,3 +34,16 @@ class SubmissionTests(unittest.TestCase):
     def test_expired_answer_never_submitted(self, post):
         self.assertFalse(self.lesson.answer_questions('id', 1, ['B'], 10, elapsed=11, immediate=True))
         post.assert_not_called()
+
+    @patch('Scripts.Classes.requests.post')
+    def test_backfilled_fractional_time_submits_without_random_wait(self, post):
+        post.return_value = Mock(text='{"code":0}')
+        self.assertTrue(self.lesson.answer_questions('id', 1, ['B'], 119.7, elapsed=1, immediate=True))
+        post.assert_called_once()
+
+    @patch('Scripts.Classes.requests.post')
+    def test_malformed_submission_reply_is_unknown_and_not_retried(self, post):
+        post.return_value = Mock(text='{}')
+        self.assertFalse(self.lesson.answer_questions('id', 1, ['B'], 120, immediate=True))
+        post.assert_called_once()
+        self.assertIn('未确认', self.lesson.add_message.call_args.args[0])

@@ -23,7 +23,7 @@ def test_network():
     # 网络状态测试
     try:
         http = urllib3.PoolManager()
-        http.request('GET', 'https://baidu.com')
+        http.request('GET', 'https://baidu.com', timeout=urllib3.Timeout(connect=5, read=5), retries=False)
         return True
     except:
         return False
@@ -116,7 +116,8 @@ def get_user_info(sessionid):
         "Cookie":"sessionid=%s" % sessionid,
         "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:97.0) Gecko/20100101 Firefox/97.0",
     }
-    r = requests.get(url="https://www.yuketang.cn/api/v3/user/basic-info",headers=headers,proxies={"http": None,"https":None})
+    r = requests.get(url="https://www.yuketang.cn/api/v3/user/basic-info",headers=headers,proxies={"http": None,"https":None}, timeout=10)
+    r.raise_for_status()
     rtn = dict_result(r.text)
     return (rtn["code"],rtn["data"])
 
@@ -126,8 +127,15 @@ def get_on_lesson(sessionid):
         "Cookie":"sessionid=%s" % sessionid,
         "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:97.0) Gecko/20100101 Firefox/97.0",
     }
-    r = requests.get("https://www.yuketang.cn/api/v3/classroom/on-lesson",headers=headers,proxies={"http": None,"https":None})
+    r = requests.get("https://www.yuketang.cn/api/v3/classroom/on-lesson",headers=headers,proxies={"http": None,"https":None}, timeout=10)
+    if r.status_code in (401, 403):
+        raise PermissionError('登录已失效，请重新登录')
+    r.raise_for_status()
     rtn = dict_result(r.text)
+    if rtn.get('code') in (50000, 50001):
+        raise PermissionError('登录已失效，请重新登录')
+    if rtn.get('code', 0) != 0:
+        raise RuntimeError('课程检测失败，请稍后重试')
     return rtn["data"]["onLessonClassrooms"]
 
 def get_on_lesson_old(sessionid):
@@ -136,7 +144,7 @@ def get_on_lesson_old(sessionid):
         "Cookie":"sessionid=%s" % sessionid,
         "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:97.0) Gecko/20100101 Firefox/97.0",
     }
-    r = requests.get("https://www.yuketang.cn/v/course_meta/on_lesson_courses",headers=headers,proxies={"http": None,"https":None})
+    r = requests.get("https://www.yuketang.cn/v/course_meta/on_lesson_courses",headers=headers,proxies={"http": None,"https":None}, timeout=10)
     rtn = dict_result(r.text)
     return rtn["on_lessons"]
 

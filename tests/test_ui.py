@@ -25,15 +25,18 @@ class UITests(unittest.TestCase):
         self.assertTrue(review.event.is_set())
         self.assertFalse(review.cancelled)
 
-    def test_timer_submits_modified_text(self):
+    def test_manual_edit_pauses_auto_submission(self):
         review = self.make_review(5, ['初始答案'], seconds=0.02)
         dialog = AnswerDialog(review)
         dialog.editors[0].setPlainText('修改后的答案')
         loop = QtCore.QEventLoop()
         QtCore.QTimer.singleShot(180, loop.quit)
         loop.exec_()
-        self.assertTrue(review.event.is_set())
+        self.assertFalse(review.event.is_set())
+        self.assertFalse(review.auto_submit)
         self.assertEqual(review.answers, ['修改后的答案'])
+        dialog.confirm()
+        self.assertTrue(review.event.is_set())
 
     def test_close_cancels(self):
         review = self.make_review()
@@ -75,6 +78,9 @@ class UITests(unittest.TestCase):
             ui.is_active = True
             review = self.make_review()
             ui.show_answer_review(review)
+            self.assertEqual(len(ui.review_dialogs), 0)
+            self.assertIs(ui.workspace.active, review)
+            ui.open_review_dialog(review)
             self.assertEqual(len(ui.review_dialogs), 1)
             ui.cancel_reviews()
             self.assertTrue(review.cancelled)

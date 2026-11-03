@@ -1,37 +1,46 @@
 """分页配置面板：固定保存栏，验证通过后原子保存。"""
 import copy
 import json
+import threading
+import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 from PyQt5 import QtCore, QtGui, QtWidgets
 from Scripts.Utils import get_config_path, get_initial_data, resource_path
 from Scripts.Providers import PRESETS
-from UI.Theme import STYLE
+from UI.Theme import STYLE, prepare_fonts
+from UI.Components import ToggleSwitch
+
+
+class ConnectionTestSignals(QtCore.QObject):
+    completed = QtCore.pyqtSignal(int, object)
 
 SETTINGS_STYLE = '''
-QDialog#settings { background: #f4f7fc; }
-QLabel#settingsTitle { font-size: 20pt; font-weight: 600; color: #182c4b; }
-QLabel#sectionTitle { font-size: 12pt; font-weight: 600; }
-QFrame#card { background: white; border: 1px solid #e0e7f1; border-radius: 12px; }
-QLabel#hint, QLabel#status { color: #6b7e98; font-size: 9pt; }
-QLabel#error { color: #bd3745; font-size: 9pt; }
-QFrame#footer { background: white; border-top: 1px solid #e0e7f1; }
+QDialog#settings { background: #f5f7fa; }
+QLabel#settingsTitle { color: #1e2b3d; font-size: 22px; font-weight: 500; }
+QFrame#card { background: #ffffff; border: 1px solid #dce3ec; border-radius: 8px; }
+QLabel#fieldLabel { color: #344b6a; font-size: 13px; }
+QLabel#error { color: #a7352f; font-size: 12px; }
+QFrame#footer { background: #ffffff; border-top: 1px solid #dfe6f0; }
 QTabWidget::pane { border: none; }
-QTabBar::tab { background: transparent; color: #75849a; padding: 10px 22px; border-bottom: 3px solid transparent; }
-QTabBar::tab:selected { color: #2d60cc; border-bottom: 3px solid #3367d6; font-weight: 600; }
-QToolButton { color: #3367d6; border: none; padding: 4px; background: transparent; }
-QLineEdit[invalid="true"], QComboBox[invalid="true"] { border: 1px solid #d85a66; background: #fff8f8; }
-QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled { background: #f1f4f8; color: #97a3b6; }
-QComboBox::drop-down { border: none; width: 26px; }
-QSpinBox::up-button, QSpinBox::down-button { border: none; width: 22px; background: #edf3fc; }
-QScrollBar:vertical { width: 8px; background: transparent; margin: 2px; }
-QScrollBar::handle:vertical { background: #c8d5e7; border-radius: 3px; min-height: 30px; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+QListWidget#settingsNav { background: #edf1f7; border: none; padding: 12px 8px; outline: none; font-size: 14px; }
+QListWidget#settingsNav::item { padding: 12px 8px; margin-bottom: 6px; border: 1px solid transparent; border-radius: 6px; color: #435c7c; }
+QListWidget#settingsNav::item:selected { background: #ffffff; color: #315bcb; border-color: #d5e1fa; font-weight: 500; }
+QListWidget#settingsNav::item:focus { border-color: #3563e9; }
+QLineEdit[invalid="true"], QComboBox[invalid="true"] { border: 1px solid #bc5749; background: #fff8f7; }
+QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled { background: #f1f4f8; color: #7b899c; }
+QSpinBox::up-button, QSpinBox::down-button { width: 22px; }
 '''
 
 
+
 class SettingsCombo(QtWidgets.QComboBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.setMinimumContentsLength(3)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
     def wheelEvent(self, event):
         if self.view().isVisible():
             super().wheelEvent(event)
@@ -48,9 +57,15 @@ class SettingsSpin(QtWidgets.QSpinBox):
 
 
 class Config_Ui:
-    def setupUi(self, Dialog):
+    def setupUi(self, Dialog, preview=False):
+        self.preview_mode = preview
+        prepare_fonts(QtWidgets.QApplication.instance())
         self.dialog, self.loading = Dialog, True
         self.provider_profiles, self.current_provider, self.errors = {}, 0, {}
+        self._test_generation = 0
+        self._test_running = False
+        self._test_signals = ConnectionTestSignals(Dialog)
+        self._test_signals.completed.connect(self.finish_connection_test)
         Dialog.setObjectName('settings')
         Dialog.setWindowTitle('设置 · 雨课堂助手')
         Dialog.setWindowIcon(QtGui.QIcon(resource_path('UI/Image/app-icon.ico')))
@@ -64,20 +79,35 @@ class Config_Ui:
         root.setSpacing(0)
         header = QtWidgets.QWidget()
         head = QtWidgets.QVBoxLayout(header)
-        head.setContentsMargins(26, 20, 26, 10)
-        title = QtWidgets.QLabel('偏好设置')
+        head.setContentsMargins(22, 18, 22, 14)
+        title = QtWidgets.QLabel('工作台设置')
         title.setObjectName('settingsTitle')
         head.addWidget(title)
-        head.addWidget(self.hint('连接你的模型，安排答案核对时间，选择需要的课堂提醒。'))
+        head.addWidget(self.hint('连接模型、安排提交时间，并管理课堂提醒。'))
         root.addWidget(header)
         self.tabs = QtWidgets.QTabWidget()
-        root.addWidget(self.tabs, 1)
+        self.tabs.tabBar().hide()
+        settings_body = QtWidgets.QWidget()
+        settings_row = QtWidgets.QHBoxLayout(settings_body)
+        settings_row.setContentsMargins(0, 0, 0, 0)
+        settings_row.setSpacing(0)
+        self.navigation = QtWidgets.QListWidget()
+        self.navigation.setObjectName('settingsNav')
+        self.navigation.setAccessibleName('设置分类')
+        self.navigation.setFixedWidth(120)
+        self.navigation.addItems(['模型连接', '答案提交', '课堂提醒'])
+        settings_row.addWidget(self.navigation)
+        settings_row.addWidget(self.tabs, 1)
+        root.addWidget(settings_body, 1)
+        self.navigation.currentRowChanged.connect(self.tabs.setCurrentIndex)
+        self.tabs.currentChanged.connect(self.navigation.setCurrentRow)
+        self.navigation.setCurrentRow(0)
         models, self.scrollArea = self.page('大模型连接')
         answers, _ = self.page('答案与提交')
         notices, _ = self.page('提醒与弹幕')
 
         layout = self.card(models, '模型连接', '选择服务商后填写密钥，即可开始使用。')
-        self.llm_on = QtWidgets.QCheckBox('启用大模型答题')
+        self.llm_on = ToggleSwitch('启用大模型答题')
         layout.addWidget(self.llm_on)
         self.when_llm_on, fields = self.container(layout)
         self.provider_select = SettingsCombo()
@@ -106,34 +136,37 @@ class Config_Ui:
         self.show_key = QtWidgets.QToolButton()
         self.show_key.setText('显示')
         self.show_key.setCheckable(True)
+        self.show_key.setAccessibleName('显示或隐藏 API Key')
         self.show_key.toggled.connect(self.toggle_key)
         row.addWidget(self.llm_api_key_input, 1)
         row.addWidget(self.show_key)
         self.field(fields, 'API Key', key_row, 'key')
         fields.addWidget(self.hint('切换服务商会保留各自的密钥、模型和接口设置。'))
         self.advanced_toggle = QtWidgets.QToolButton()
-        self.advanced_toggle.setText('接口地址与超时')
+        self.advanced_toggle.setText('高级设置 · 接口、路由与费用')
         self.advanced_toggle.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
         self.advanced_toggle.setArrowType(QtCore.Qt.RightArrow)
         self.advanced_toggle.setCheckable(True)
+        self.advanced_toggle.setProperty('role', 'link')
         fields.addWidget(self.advanced_toggle)
         self.advanced, advanced = self.container(fields)
         self.structured_mode = QtWidgets.QComboBox()
         for text, value in (('自动（按服务商适配）','auto'), ('严格 JSON Schema（需模型支持）','schema'),
                             ('JSON Object（需接口支持）','json'), ('仅使用提示词','prompt')):
             self.structured_mode.addItem(text, value)
-        self.field(advanced, '结构化输出模式', self.structured_mode)
+        self.field(advanced, '响应格式', self.structured_mode)
         self.llm_base_url_input = QtWidgets.QLineEdit()
         self.llm_base_url_input.setPlaceholderText('https://api.example.com/v1')
         self.llm_base_url_input.setClearButtonEnabled(True)
         self.field(advanced, '接口地址', self.llm_base_url_input, 'url')
         advanced.addWidget(self.hint('支持粘贴完整 /chat/completions 地址，保存时自动整理。'))
         self.llm_timeout_input = self.spin(5, 600, ' 秒')
-        self.field(advanced, '单次请求超时', self.llm_timeout_input)
-        advanced.addWidget(self.hint('推荐 30 秒。重试受题目剩余时间限制；DeepSeek 至少等待 30 秒。'))
+        self.field(advanced, '模型总等待上限', self.llm_timeout_input)
+        advanced.addWidget(self.hint('推荐 30 秒。图片获取与重试计入上限；限时题另外预留 5 秒提交。'))
         self.vision_model_input = QtWidgets.QLineEdit()
         self.vision_model_input.setPlaceholderText('留空使用当前模型（必须支持图片输入）')
-        self.field(advanced, '图片题模型（同一服务商）', self.vision_model_input)
+        advanced.addWidget(self.hint('模型策略'))
+        self.field(advanced, '图片题模型 · 同一服务商', self.vision_model_input)
         self.alternate_models_input = QtWidgets.QLineEdit()
         self.alternate_models_input.setPlaceholderText('可选：用英文逗号分隔，如 model-a, model-b')
         self.field(advanced, '顶部可切换的模型', self.alternate_models_input)
@@ -159,17 +192,43 @@ class Config_Ui:
         self.advanced.hide()
         self.advanced_toggle.toggled.connect(self.toggle_advanced)
         self.llm_config = self.when_llm_on
+        test_row = QtWidgets.QHBoxLayout()
+        self.test_button = QtWidgets.QPushButton('测试大模型连接')
+        self.test_button.setEnabled(not preview)
+        self.test_button.setToolTip('使用当前填写的配置发送一次最小模型请求，会产生少量调用费用。')
+        self.test_button.clicked.connect(self.start_connection_test)
+        test_row.addWidget(self.test_button)
+        test_row.addStretch()
+        layout.addLayout(test_row)
+        self.test_result = self.hint('尚未测试 · 使用当前填写的地址、密钥和模型，无需先保存。')
+        self.test_result.setTextFormat(QtCore.Qt.PlainText)
+        layout.addWidget(self.test_result)
+        for field in (self.llm_base_url_input, self.llm_api_key_input, self.llm_model_input, self.vision_model_input):
+            field.textChanged.connect(self.invalidate_connection_test)
+        self.llm_timeout_input.valueChanged.connect(self.invalidate_connection_test)
+        self.structured_mode.currentIndexChanged.connect(self.invalidate_connection_test)
         models.addWidget(self.hint('题目和图片会发送到所选接口。密钥仅保存在当前项目的本地配置中。'))
         models.addStretch()
 
         layout = self.card(answers, '答案核对', '先看答案，再决定是否修改或立即提交。')
-        self.answer_on = QtWidgets.QCheckBox('启用模型答题与答案核对')
+        self.answer_on = ToggleSwitch('生成答案并弹窗核对')
         layout.addWidget(self.answer_on)
         self.when_answer_on, fields = self.container(layout)
         self.review_seconds_input = self.spin(1, 300, ' 秒')
-        self.field(fields, '自动提交延迟下限', self.review_seconds_input)
         self.review_max_input = self.spin(1, 300, ' 秒')
-        self.field(fields, '自动提交延迟上限', self.review_max_input)
+        delay_row = QtWidgets.QHBoxLayout()
+        for name, control in (('延迟下限', self.review_seconds_input), ('延迟上限', self.review_max_input)):
+            column = QtWidgets.QVBoxLayout()
+            self.field(column, name, control)
+            delay_row.addLayout(column, 1)
+        fields.addLayout(delay_row)
+        self.delay_error = QtWidgets.QLabel()
+        self.delay_error.setObjectName('error')
+        self.delay_error.setWordWrap(True)
+        self.delay_error.hide()
+        fields.addWidget(self.delay_error)
+        self.review_seconds_input.valueChanged.connect(self.delay_error.hide)
+        self.review_max_input.valueChanged.connect(self.delay_error.hide)
         fields.addWidget(self.hint('开启自动提交时，从答案生成后在区间内随机计时；临近截止会缩短等待并预留 5 秒提交。'))
         self.answer_hint = self.hint('')
         layout.addWidget(self.answer_hint)
@@ -180,7 +239,7 @@ class Config_Ui:
         answers.addStretch()
 
         layout = self.card(notices, '课堂提醒', '仅播报你关心的事件。')
-        self.audio_on = QtWidgets.QCheckBox('开启语音提醒')
+        self.audio_on = ToggleSwitch('开启语音提醒')
         layout.addWidget(self.audio_on)
         self.when_audio_on = QtWidgets.QWidget()
         grid = QtWidgets.QGridLayout(self.when_audio_on)
@@ -247,6 +306,10 @@ class Config_Ui:
         self.llm_base_url_input.editingFinished.connect(self.normalize_url_field)
         self.llm_api_key_input.editingFinished.connect(lambda: self.llm_api_key_input.setText(self.llm_api_key_input.text().strip()))
         self.load_config(get_initial_data())
+        if preview:
+            self.save.setEnabled(False)
+            self.save_shortcut.setEnabled(False)
+            self.status.setText('界面预览 · 不会保存设置')
 
     def hint(self, text):
         label = QtWidgets.QLabel(text)
@@ -262,7 +325,7 @@ class Config_Ui:
         area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         content = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(content)
-        layout.setContentsMargins(24, 18, 24, 18)
+        layout.setContentsMargins(16, 12, 16, 16)
         layout.setSpacing(14)
         area.setWidget(content)
         self.tabs.addTab(area, title)
@@ -272,8 +335,8 @@ class Config_Ui:
         frame = QtWidgets.QFrame()
         frame.setObjectName('card')
         layout = QtWidgets.QVBoxLayout(frame)
-        layout.setContentsMargins(22, 18, 22, 20)
-        layout.setSpacing(10)
+        layout.setContentsMargins(16, 14, 16, 16)
+        layout.setSpacing(8)
         label = QtWidgets.QLabel(title)
         label.setObjectName('sectionTitle')
         layout.addWidget(label)
@@ -286,12 +349,15 @@ class Config_Ui:
         widget = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(widget)
         layout.setContentsMargins(0, 8, 0, 0)
-        layout.setSpacing(10)
+        layout.setSpacing(8)
         parent.addWidget(widget)
         return widget, layout
 
     def field(self, layout, label, widget, key=None):
-        layout.addWidget(QtWidgets.QLabel(label))
+        field_label = QtWidgets.QLabel(label)
+        field_label.setObjectName('fieldLabel')
+        field_label.setBuddy(self.llm_api_key_input if key == 'key' else widget)
+        layout.addWidget(field_label)
         layout.addWidget(widget)
         if key:
             error = QtWidgets.QLabel()
@@ -454,12 +520,66 @@ class Config_Ui:
         widget.style().unpolish(widget)
         widget.style().polish(widget)
 
+    def invalidate_connection_test(self, *args):
+        self._test_generation += 1
+        self._test_running = False
+        if hasattr(self, 'test_result'):
+            self.test_result.setText('配置已变更，请重新测试。' if not self.loading else '尚未测试 · 使用当前填写的配置，无需先保存。')
+            self.test_button.setText('测试大模型连接')
+            self.test_button.setEnabled(not self.preview_mode)
+
+    def start_connection_test(self):
+        if self.preview_mode or self._test_running:
+            return
+        profile = self.profile()
+        try:
+            url = urlsplit(profile['base_url'])
+            valid_url = url.scheme in ('http', 'https') and bool(url.hostname) and not url.username and not url.password and not url.query and not url.fragment
+        except ValueError:
+            valid_url = False
+        if not valid_url or not profile['api_key'] or not profile['model'] or any(char.isspace() for char in profile['api_key'] + profile['model']):
+            self.test_result.setText('无法测试：请填写有效的接口地址、API Key 和模型名称。')
+            return
+        self._test_generation += 1
+        generation = self._test_generation
+        self._test_running = True
+        self.test_button.setEnabled(False)
+        self.test_button.setText('正在测试…')
+        self.test_result.setText('正在请求模型 %s，测试不会提交任何课堂答案。' % profile['model'])
+        signal = self._test_signals
+        def run():
+            try:
+                from Scripts.LLM import test_connection
+                result = test_connection(profile)
+            except Exception:
+                result = {'ok': False, 'message': '连接测试失败，请检查配置后重试。', 'model': profile['model']}
+            try:
+                signal.completed.emit(generation, result)
+            except RuntimeError:
+                pass  # 对话框已关闭，后台结果不再访问窗口。
+        threading.Thread(target=run, daemon=True).start()
+
+    def finish_connection_test(self, generation, result):
+        if generation != self._test_generation:
+            return
+        self._test_running = False
+        self.test_button.setEnabled(not self.preview_mode)
+        self.test_button.setText('重新测试连接')
+        stamp = datetime.datetime.now().strftime('%H:%M:%S')
+        latency = result.get('latency_ms')
+        elapsed = ' · %.2f 秒' % (latency / 1000) if isinstance(latency, (int,float)) else ''
+        self.test_result.setText('%s · %s%s · %s\n%s' % ('测试通过' if result.get('ok') else '测试失败',
+            result.get('model') or self.llm_model_input.text(), elapsed, stamp, result.get('message') or result.get('status') or ''))
+
     def validate(self):
         for key in self.errors:
             self.set_error(key, '')
         if self.review_seconds_input.value() > self.review_max_input.value():
             self.tabs.setCurrentIndex(1)
-            self.status.setText('尚未保存：自动提交延迟下限不能大于上限')
+            self.delay_error.setText('延迟下限不能大于上限，请调整后保存。')
+            self.delay_error.show()
+            self.review_seconds_input.setFocus()
+            self.status.setText('尚未保存，请检查延迟时间')
             return False
         if not self.llm_on.isChecked():
             return True
@@ -494,6 +614,8 @@ class Config_Ui:
         return True
 
     def save_config(self, dialog):
+        if self.preview_mode:
+            return False
         if not self.validate():
             return False
         config = copy.deepcopy(self.base_config)
