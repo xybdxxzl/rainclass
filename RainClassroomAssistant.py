@@ -5,6 +5,9 @@ from UI.Theme import STYLE, prepare_fonts
 from Scripts.Utils import resource_path
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == '--render-review':
+        from Scripts.ReviewExport import render_request
+        raise SystemExit(render_request(sys.argv[2]))
     # 初始化
     if sys.platform == 'win32':
         import ctypes
