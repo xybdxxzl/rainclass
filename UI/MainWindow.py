@@ -15,6 +15,7 @@ from UI.Components import ElidingLabel
 from UI.Workspace import Workspace
 from UI.HistoryDialog import HistoryDialog
 from Scripts.History import HistoryStore
+from UI.ReviewDialog import ReviewDialog
     
 class MainWindow_Ui(QtCore.QObject):
     # 需要建立信号槽，解决无法在线程中修改UI值问题
@@ -81,7 +82,10 @@ class MainWindow_Ui(QtCore.QObject):
         self.history_btn = QtWidgets.QPushButton('历史题目')
         self.history_btn.setObjectName('headerSecondary')
         self.history_btn.clicked.connect(self.show_history)
-        for button in (self.active_btn, self.login_btn, self.history_btn, self.config_btn):
+        self.review_btn = QtWidgets.QPushButton('期末复习')
+        self.review_btn.setObjectName('headerSecondary')
+        self.review_btn.clicked.connect(self.show_review)
+        for button in (self.active_btn, self.login_btn, self.history_btn, self.review_btn, self.config_btn):
             button.setMinimumHeight(34)
             button.setCursor(QtCore.Qt.PointingHandCursor)
             header.addWidget(button)
@@ -269,6 +273,13 @@ class MainWindow_Ui(QtCore.QObject):
 
     def show_history(self):
         dialog = HistoryDialog(self.history_store, self.account_id, self.user_name, self.main_window)
+        dialog.exec_()
+
+    def show_review(self):
+        if not self.account_id or not self.config.get('sessionid'):
+            QtWidgets.QMessageBox.information(self.main_window, '期末复习', '请先登录雨课堂账号，再打开期末复习。')
+            return
+        dialog = ReviewDialog(self.config, self.account_id, self.user_name, self.main_window)
         dialog.exec_()
 
     def review_dialog_for(self, review):
