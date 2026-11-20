@@ -12,7 +12,6 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.regex.*;
 import okhttp3.*;
 
 /** 课堂轮询与 WebSocket 在前台服务中运行；答案由 ReviewRegistry 统一完成。 */
@@ -320,10 +319,22 @@ public class MonitorService extends Service {
                 String encoded = java.net.URLEncoder.encode(presentation, "UTF-8");
                 JSONObject result = callJson(rainRequest("/api/v3/lesson/presentation/fetch?presentation_id=" + encoded, auth).get().build(), 0);
                 JSONArray slides = result.getJSONObject("data").getJSONArray("slides");
-                for (int i=0;i<slides.length();i++) {
-                    JSONObject p = slides.getJSONObject(i).optJSONObject("problem");
-                    if (p != null && p.has("problemId")) problems.put(p.getString("problemId"), p);
+                Set<String> updated = new HashSet<>();
+                for (int i = 0; i < slides.length(); i++) {
+                    JSONObject problem = slides.getJSONObject(i).optJSONObject("problem");
+                    if (problem != null && problem.has("problemId")) {
+                        String problemId = problem.getString("problemId");
+                        problems.put(problemId, problem);
+                        updated.add(problemId);
+                    }
                 }
+                if (!updated.isEmpty() && !closed) serial.execute(() -> {
+                    for (String reviewId : reviewIds) {
+                        ReviewRegistry.Review review = ReviewRegistry.get(reviewId);
+                        if (review != null && updated.contains(review.problemId)) refreshQuestion(review, null);
+                    }
+                });
+            } catch (RejectedExecutionException ignored) {
             } catch (Exception e) {
                 if (running && !closed) {
                     log(name + "：无法获取课件题面，请在雨课堂查看（" + safeMessage(e) + "）");
@@ -405,21 +416,24 @@ public class MonitorService extends Service {
             if(!running||closed)return;
             boolean missingIdentity=problemId==null||problemId.isEmpty();
             if(missingIdentity)problemId="unknown-"+Integer.toHexString(String.valueOf(pushed).hashCode());
-            if(!dispatched.add(problemId)){
-                JSONObject incoming=mergeProblem(problems.get(problemId),pushed);
-                for(ReviewRegistry.Review current:ReviewRegistry.list())if(current.lessonId.equals(id)&&current.problemId.equals(problemId)){
-                    boolean timingWasUnknown=current.questionDeadlineElapsed==-2;
-                    if(questionDeadline!=-2){current.questionDeadlineElapsed=questionDeadline;scheduleExpiry(current);}
-                    if(timingWasUnknown||"题面待补全".equals(current.modelState)||"题面获取失败".equals(current.modelState)){
-                        synchronized(current.problem){for(Iterator<String> it=incoming.keys();it.hasNext();){String k=it.next();try{current.problem.put(k,incoming.opt(k));}catch(JSONException ignored){}}}
-                        current.type=incoming.optInt("problemType",current.type);
-                        if(hasContent(current.problem)){ReviewRegistry.modelState(current,"未请求","已补充题目信息，可手动作答");beginModel(current);}
+            if (!dispatched.add(problemId)) {
+                for (String reviewId : reviewIds) {
+                    ReviewRegistry.Review review = ReviewRegistry.get(reviewId);
+                    if (review == null || !review.problemId.equals(problemId)) continue;
+                    boolean timingWasUnknown = review.questionDeadlineElapsed == -2;
+                    if (questionDeadline != -2 && review.questionDeadlineElapsed != questionDeadline) {
+                        review.questionDeadlineElapsed = questionDeadline;
+                        scheduleExpiry(review);
                     }
+                    boolean needsModel = ReviewRegistry.refreshProblem(review, problems.get(problemId), pushed);
+                    if (needsModel || (timingWasUnknown && questionDeadline != -2)) beginModel(review);
+                    break;
                 }
                 return;
             }
-            final String pid=problemId;
-            JSONObject cached=problems.get(pid),problem=mergeProblem(cached,pushed);
+            final String pid = problemId;
+            JSONObject cached = problems.get(pid);
+            JSONObject problem = QuestionContent.merge(cached, pushed);
             int type=problem.optInt("problemType",-1);
             if(missingIdentity)try{problem.put("_identity_missing",true);}catch(JSONException ignored){}
             String account=userId==null?prefs.getString("user_id",""):String.valueOf(userId);
@@ -446,7 +460,7 @@ public class MonitorService extends Service {
             notifyReview(review);speak(name+"，收到新题目");
             if(questionDeadline==-2){
                 ReviewRegistry.modelState(review,"未请求","已收到题目，但时限信息缺失，待补全后才可提交");
-                if(socket!=null)try{socket.send(new JSONObject().put("op","probleminfo").put("lessonid",id).put("problemid",pid).put("msgid",1).toString());}catch(JSONException ignored){}
+                requestProblemInfo(pid);
             }else if(questionDeadline!=-1&&questionDeadline<=SystemClock.elapsedRealtime()){
                 ReviewRegistry.expire(review.id);log(name+"：已收到题目，但题目已过期");return;
             }else scheduleExpiry(review);
@@ -454,24 +468,50 @@ public class MonitorService extends Service {
             if(cached!=null&&cached.has("result")&&!cached.isNull("result")){
                 ReviewRegistry.modelState(review,"未请求","服务端标记本题已作答");ReviewRegistry.submission(review,"已作答");ReviewRegistry.cancel(review.id);ReviewRegistry.submission(review,"已作答");return;
             }
-            if(type==-1||!hasContent(problem)||((type==1||type==2)&&(problem.optJSONArray("options")==null||problem.optJSONArray("options").length()==0))){
-                ReviewRegistry.modelState(review,"题面待补全","已收到题目，正在重新获取题面");
-                if(socket!=null)try{socket.send(new JSONObject().put("op","probleminfo").put("lessonid",id).put("problemid",pid).put("msgid",1).toString());}catch(JSONException ignored){}
-                try{workers.execute(()->{
-                    cache(latestPresentation);
-                    JSONObject full=mergeProblem(problems.get(pid),pushed);
-                    review.type=full.optInt("problemType",review.type);
-                    synchronized(problem){for(Iterator<String> it=full.keys();it.hasNext();){String k=it.next();try{problem.put(k,full.opt(k));}catch(JSONException ignored){}}}
-                    if(!hasContent(full)||((review.type==1||review.type==2)&&(full.optJSONArray("options")==null||full.optJSONArray("options").length()==0))){
-                        ReviewRegistry.modelState(review,"题面获取失败","已收到题目，但题面或选项不完整；可重新获取题面");return;
-                    }
-                    ReviewRegistry.modelState(review,"未请求","题面已补全，可重新打开题目作答");changed();
-                    beginModel(review);
-                });}catch(RejectedExecutionException ignored){}
+            if (type == -1 || !QuestionContent.hasContent(problem)
+                    || ((type == 1 || type == 2) && !QuestionContent.hasOptions(problem))) {
+                ReviewRegistry.modelState(review, "题面待补全", "已收到题目，正在重新获取题面");
+                refetchQuestion(review, false);
                 return;
             }
-            beginModel(review);
+            if (!refreshQuestion(review, null)) beginModel(review);
         }
+
+        boolean refreshQuestion(ReviewRegistry.Review review, JSONObject pushed) {
+            boolean restart = ReviewRegistry.refreshProblem(review, problems.get(review.problemId), pushed);
+            if (restart) beginModel(review);
+            return restart;
+        }
+
+        void requestProblemInfo(String problemId) {
+            WebSocket ws = socket;
+            if (ws == null || !running || closed) return;
+            try {
+                ws.send(new JSONObject().put("op", "probleminfo").put("lessonid", id)
+                        .put("problemid", problemId).put("msgid", 1).toString());
+            } catch (JSONException ignored) { }
+        }
+
+        void refetchQuestion(ReviewRegistry.Review review, boolean retryImages) {
+            if (review.ended() || closed) return;
+            requestProblemInfo(review.problemId);
+            try {
+                workers.execute(() -> {
+                    cache(latestPresentation);
+                    try {
+                        serial.execute(() -> {
+                            if (review.ended()) return;
+                            if (!ReviewRegistry.readyForModel(review.type, review.problem)) {
+                                ReviewRegistry.modelState(review, "题面获取失败", "题面或选项尚未完整，请重新获取或在雨课堂查看");
+                            } else if (retryImages && "图片获取失败".equals(review.modelState)) {
+                                beginModel(review);
+                            }
+                        });
+                    } catch (RejectedExecutionException ignored) { }
+                });
+            } catch (RejectedExecutionException ignored) { }
+        }
+
         void scheduleExpiry(ReviewRegistry.Review review){
             long d=review.questionDeadlineElapsed;if(d==-1||d==-2)return;
             try{timers.schedule(()->{
@@ -479,47 +519,68 @@ public class MonitorService extends Service {
                 if(current!=-1&&current!=-2&&SystemClock.elapsedRealtime()>=current)ReviewRegistry.expire(review.id);
             },Math.max(0,d-SystemClock.elapsedRealtime()),TimeUnit.MILLISECONDS);}catch(RejectedExecutionException ignored){}
         }
-        void beginModel(ReviewRegistry.Review review){
-            if(review.ended()||!running||closed)return;
-            if(review.questionDeadlineElapsed==-2){ReviewRegistry.modelState(review,"未请求","题目时限待确认，暂不能提交，可先选择答案");return;}
-            if(review.type!=1&&review.type!=2&&review.type!=4&&review.type!=5){ReviewRegistry.modelState(review,"未请求","题型暂不支持，请在雨课堂查看");return;}
-            if(!prefs.getBoolean("auto_answer",true)){ReviewRegistry.modelState(review,"未请求","模型已关闭，可立即手动作答");return;}
-            if(!ReviewRegistry.beginModel(review))return;
-            try{workers.execute(()->answer(review));}catch(RejectedExecutionException ignored){}
+        void beginModel(ReviewRegistry.Review review) {
+            if (review.ended() || !running || closed) return;
+            if (review.questionDeadlineElapsed == -2) {
+                ReviewRegistry.modelState(review, "未请求", "题目时限待确认，暂不能提交，可先选择答案");
+                return;
+            }
+            if (review.type != 1 && review.type != 2 && review.type != 4 && review.type != 5) {
+                ReviewRegistry.modelState(review, "未请求", "题型暂不支持，请在雨课堂查看");
+                return;
+            }
+            if (!ReviewRegistry.readyForModel(review.type, review.problem)) return;
+            if (!prefs.getBoolean("auto_answer", true)) {
+                ReviewRegistry.modelState(review, "未请求", "模型已关闭，可立即手动作答");
+                return;
+            }
+            ReviewRegistry.ModelRequest request = ReviewRegistry.startModel(review);
+            if (request == null) return;
+            try { workers.execute(() -> answer(review, request)); }
+            catch (RejectedExecutionException ignored) { }
         }
-        void answer(ReviewRegistry.Review review){
-            if(review.ended()||!running||closed)return;
-            long configured=Math.max(5,Math.min(600,prefs.getInt("timeout",30)))*1000L;
-            long deadline=SystemClock.elapsedRealtime()+configured;
-            if(review.questionDeadlineElapsed!=-1)deadline=Math.min(deadline,review.questionDeadlineElapsed-5000);
-            final long totalDeadline=deadline;
-            ScheduledFuture<?> watchdog=null;
-            try{
-                watchdog=timers.schedule(()->{
-                    if("处理中".equals(review.modelState)||"重试中".equals(review.modelState))
-                        ReviewRegistry.modelState(review,"超时","模型已超过总等待上限，仍可手动作答");
-                },Math.max(0,deadline-SystemClock.elapsedRealtime()),TimeUnit.MILLISECONDS);
-                JSONArray content=questionContent(review.problem,review.type,deadline);
-                JSONArray answers=ModelClient.complete(http,prefs.getString("base_url",""),prefs.getString("api_key",""),prefs.getString("model",""),
-                    content,review.type,review.problem,deadline,()->running&&!closed&&!review.ended(),message->ReviewRegistry.modelState(review,"重试中",message));
-                if(!running||closed||review.ended()||SystemClock.elapsedRealtime()>=totalDeadline)return;
-                long now=SystemClock.elapsedRealtime();
-                long reviewMs=Math.max(1,Math.min(300,prefs.getInt("review_seconds",15)))*1000L;
-                if(review.questionDeadlineElapsed!=-1)reviewMs=Math.min(reviewMs,Math.max(0,review.questionDeadlineElapsed-now-5000));
-                if(ReviewRegistry.applyModel(review.id,answers,now+reviewMs,prefs.getBoolean("auto_submit",true))&&review.autoSubmit){
-                    timers.schedule(()->ReviewRegistry.autoSubmit(review.id),Math.max(0,review.deadlineElapsed-SystemClock.elapsedRealtime()),TimeUnit.MILLISECONDS);
+
+        void answer(ReviewRegistry.Review review, ReviewRegistry.ModelRequest request) {
+            java.util.function.BooleanSupplier active = () -> running && !closed && ReviewRegistry.modelActive(review, request);
+            if (!active.getAsBoolean()) return;
+            long configured = Math.max(5, Math.min(600, prefs.getInt("timeout", 30))) * 1000L;
+            long cutoff = SystemClock.elapsedRealtime() + configured;
+            if (review.questionDeadlineElapsed != -1) cutoff = Math.min(cutoff, review.questionDeadlineElapsed - 5000);
+            final long deadline = cutoff;
+            ScheduledFuture<?> watchdog = null;
+            try {
+                watchdog = timers.schedule(() -> ReviewRegistry.modelState(
+                        review, request, "超时", "模型已超过总等待上限，仍可手动作答"),
+                        Math.max(0, deadline - SystemClock.elapsedRealtime()), TimeUnit.MILLISECONDS);
+                JSONArray content = questionContent(request.problem, request.type, deadline);
+                JSONArray answers = ModelClient.complete(http, prefs.getString("base_url", ""),
+                        prefs.getString("api_key", ""), prefs.getString("model", ""), content,
+                        request.type, request.problem, deadline, active,
+                        message -> ReviewRegistry.modelState(review, request, "重试中", message));
+                long now = SystemClock.elapsedRealtime();
+                if (!active.getAsBoolean() || now >= deadline) return;
+                long reviewMs = Math.max(1, Math.min(300, prefs.getInt("review_seconds", 15))) * 1000L;
+                if (review.questionDeadlineElapsed != -1) {
+                    reviewMs = Math.min(reviewMs, Math.max(0, review.questionDeadlineElapsed - now - 5000));
                 }
-                changed();
-            }catch(Exception e){
-                if(running&&!closed&&!review.ended()){
-                    String state=e instanceof ModelClient.Failure?((ModelClient.Failure)e).state:
-                        e instanceof java.io.InterruptedIOException||SystemClock.elapsedRealtime()>=totalDeadline?"超时":"失败";
-                    String message=e instanceof ModelClient.Failure?e.getMessage():safeMessage(e);
-                    ReviewRegistry.modelState(review,state,message+"；仍可手动作答");
+                if (ReviewRegistry.applyModel(review, request, answers, now + reviewMs,
+                        prefs.getBoolean("auto_submit", true)) && review.autoSubmit) {
+                    timers.schedule(() -> ReviewRegistry.autoSubmit(review.id),
+                            Math.max(0, review.deadlineElapsed - SystemClock.elapsedRealtime()), TimeUnit.MILLISECONDS);
                 }
-            }finally{if(watchdog!=null)watchdog.cancel(false);}
+            } catch (Exception e) {
+                if (!active.getAsBoolean()) return;
+                String state = e instanceof ModelClient.Failure ? ((ModelClient.Failure) e).state
+                        : e instanceof java.io.InterruptedIOException || SystemClock.elapsedRealtime() >= deadline ? "超时" : "失败";
+                String message = e instanceof ModelClient.Failure ? e.getMessage() : safeMessage(e);
+                if (ReviewRegistry.modelState(review, request, state, message + "。仍可手动作答")
+                        && "图片获取失败".equals(state) && ReviewRegistry.requestImageRefresh(review, request)) {
+                    requestProblemInfo(review.problemId);
+                }
+            } finally {
+                if (watchdog != null) watchdog.cancel(false);
+            }
         }
-        void manual(String message) { log(name + "：" + message); notifyCall(name + " · 请手动回答", message); }
         void submitAnswer(ReviewRegistry.Review review) {
             if (!running || closed) {ReviewRegistry.submission(review,"已取消");return;}
             long remaining = review.questionDeadlineElapsed == -1 ? 10000 : review.questionDeadlineElapsed - SystemClock.elapsedRealtime();
@@ -537,67 +598,30 @@ public class MonitorService extends Service {
     }
 
     @Override public void onTaskRemoved(Intent rootIntent){status(running?monitorState:"已停止");super.onTaskRemoved(rootIntent);}
-    private void retryReview(String reviewId){
-        ReviewRegistry.Review review=ReviewRegistry.get(reviewId);if(review==null)return;
-        Lesson lesson=lessons.get(review.lessonId);if(lesson==null)return;
-        if("处理中".equals(review.modelState)||"重试中".equals(review.modelState))return;
-        workers.execute(()->{
-            if("题面获取失败".equals(review.modelState)||"题面待补全".equals(review.modelState)){
-                lesson.cache(lesson.latestPresentation);JSONObject full=mergeProblem(lesson.problems.get(review.problemId),review.problem);
-                review.type=full.optInt("problemType",review.type);
-                synchronized(review.problem){for(Iterator<String> it=full.keys();it.hasNext();){String k=it.next();try{review.problem.put(k,full.opt(k));}catch(JSONException ignored){}}}
-                ReviewRegistry.modelState(review,hasContent(full)?"未请求":"题面获取失败",hasContent(full)?"题面已更新，请重新打开题目":"仍未获取到题面，请在雨课堂核对");
-            }else lesson.beginModel(review);
-        });
+    private void retryReview(String reviewId) {
+        ReviewRegistry.Review review = ReviewRegistry.get(reviewId);
+        if (review == null) return;
+        Lesson lesson = lessons.get(review.lessonId);
+        if (lesson == null) return;
+        try {
+            lesson.serial.execute(() -> {
+                String state = review.modelState;
+                if (review.ended() || "处理中".equals(state) || "重试中".equals(state)) return;
+                if (state.startsWith("题面") || "图片获取失败".equals(state)) {
+                    lesson.refetchQuestion(review, "图片获取失败".equals(state));
+                } else {
+                    lesson.beginModel(review);
+                }
+            });
+        } catch (RejectedExecutionException ignored) { }
     }
-    private static JSONObject mergeProblem(JSONObject cache, JSONObject pushed) {
-        JSONObject out = new JSONObject();
-        String[] keys = {"problemType", "body", "content", "title", "options", "blanks", "images"};
-        for (String key : keys) {
-            Object v = pushed == null ? null : pushed.opt(key);
-            if (v == null || v == JSONObject.NULL || "".equals(v)) v = cache == null ? null : cache.opt(key);
-            if (v != null && v != JSONObject.NULL) try { out.put(key, v); } catch (JSONException ignored) { }
-        }
-        if (!out.has("problemType")) {
-            Object type = pushed == null ? null : pushed.opt("type");
-            if (!(type instanceof Number) && cache != null) type = cache.opt("type");
-            if (type != null && type != JSONObject.NULL) try { out.put("problemType", type); } catch (JSONException ignored) { }
-        }
-        return out;
-    }
-    private static boolean hasContent(JSONObject p) {
-        return !p.optString("body", "").trim().isEmpty() || !p.optString("content", "").trim().isEmpty()
-                || !p.optString("title", "").trim().isEmpty() || p.optJSONArray("options") != null || p.optJSONArray("images") != null;
-    }
+
     private static class VisibleFailure extends Exception { VisibleFailure(String message) { super(message); } }
-    private static final Pattern IMAGE_TAG = Pattern.compile("<img\\b[^>]*>", Pattern.CASE_INSENSITIVE);
-    private static final Pattern IMAGE_ATTR = Pattern.compile("(?:^|\\s)(data-src|src)\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))", Pattern.CASE_INSENSITIVE);
-    private static String plain(String html) { return Html.fromHtml(html, Html.FROM_HTML_MODE_LEGACY).toString().replace("\uFFFC", "").trim(); }
-    private static String firstText(JSONObject p, String... keys) {
-        for (String key : keys) { String s=p.optString(key, ""); if (!s.isEmpty() && !"null".equals(s)) return s; }
-        return "";
+
+    private static String plain(String html) {
+        return Html.fromHtml(html, Html.FROM_HTML_MODE_LEGACY).toString().replace("\uFFFC", "").trim();
     }
-    private static void collectHtmlImages(String html, String label, List<String[]> images) {
-        Matcher tags = IMAGE_TAG.matcher(html);
-        while (tags.find()) {
-            Matcher attrs = IMAGE_ATTR.matcher(tags.group()); String src=null, dataSrc=null;
-            while (attrs.find()) {
-                String value=attrs.group(2)!=null ? attrs.group(2) : attrs.group(3)!=null ? attrs.group(3) : attrs.group(4);
-                if ("data-src".equalsIgnoreCase(attrs.group(1))) dataSrc=value; else src=value;
-            }
-            String value = dataSrc != null && !dataSrc.isEmpty() ? dataSrc : src;
-            if (value != null && !value.isEmpty()) images.add(new String[]{label, plain(value)});
-        }
-    }
-    private static void collectImages(Object value, String label, List<String[]> images) {
-        if (value == null || value == JSONObject.NULL) return;
-        if (value instanceof JSONArray) {
-            JSONArray list = (JSONArray)value;
-            for (int i=0;i<list.length();i++) collectImages(list.opt(i), label, images);
-        } else if (value instanceof JSONObject) {
-            String url = ((JSONObject)value).optString("url", ""); if (!url.isEmpty()) images.add(new String[]{label, url});
-        } else if (value instanceof String && !((String)value).isEmpty()) images.add(new String[]{label, (String)value});
-    }
+
     private String imageData(String src, long deadline) throws Exception {
         if (src.startsWith("data:image/")) {
             if (src.length() > 12_000_000) throw new VisibleFailure("题目图片过大");
@@ -627,28 +651,41 @@ public class MonitorService extends Service {
         }
     }
     private JSONArray questionContent(JSONObject problem, int type, long deadline) throws Exception {
-        List<String[]> images = new ArrayList<>();
-        String html = firstText(problem, "body", "content", "title");
-        StringBuilder text = new StringBuilder("题型：").append(type == 1 ? "单选题" : type == 2 ? "多选题" : type == 4 ? "填空题" : "简答题")
-                .append("\n题目：").append(plain(html));
-        collectHtmlImages(html, "题干图片", images); collectImages(problem.opt("images"), "题干图片", images);
-        if (plain(html).isEmpty() && images.isEmpty()) throw new VisibleFailure("未获取到题干");
-        JSONArray options = problem.optJSONArray("options");
-        if (options != null) for (int i=0;i<options.length();i++) {
-            Object option = options.opt(i); String key = String.valueOf((char)('A'+i)); String value;
-            if (option instanceof JSONObject) {
-                JSONObject o = (JSONObject)option; key = o.optString("key", key); value = firstText(o, "value", "content");
-                collectImages(o.opt("images"), "选项"+key+"图片", images);
-            } else value = String.valueOf(option);
-            text.append("\n").append(key).append(". ").append(plain(value));
-            collectHtmlImages(value, "选项"+key+"图片", images);
+        QuestionContent question = new QuestionContent(problem);
+        String stem = plain(question.stem.html);
+        Map<String, Set<String>> images = question.imageReferences();
+        if (stem.isEmpty() && images.isEmpty()) throw new VisibleFailure("未获取到题干");
+        StringBuilder text = new StringBuilder("题型：")
+                .append(type == 1 ? "单选题" : type == 2 ? "多选题" : type == 4 ? "填空题" : "简答题")
+                .append("\n题目：").append(stem);
+        for (Map.Entry<String, QuestionContent.Part> option : question.options.entrySet()) {
+            text.append("\n").append(option.getKey()).append(". ").append(plain(option.getValue().html));
         }
-        if (type == 4) { JSONArray blanks=problem.optJSONArray("blanks"); text.append("\n空数：").append(blanks == null || blanks.length()==0 ? 1 : blanks.length()); }
+        if (type == 4) {
+            JSONArray blanks = problem.optJSONArray("blanks");
+            text.append("\n空数：").append(blanks == null ? 1 : Math.max(1, blanks.length()));
+        }
+        Map<String, List<String>> labelsByUrl = new LinkedHashMap<>();
+        for (Map.Entry<String, Set<String>> part : images.entrySet()) {
+            for (String url : part.getValue()) {
+                if (url.isEmpty()) {
+                    throw new ModelClient.Failure("图片获取失败", part.getKey() + "缺少图片地址，请重新获取题面", false);
+                }
+                labelsByUrl.computeIfAbsent(url, key -> new ArrayList<>()).add(part.getKey());
+            }
+        }
+
         JSONArray content = new JSONArray().put(new JSONObject().put("type", "text").put("text", text.toString()));
-        Set<String> seen = new HashSet<>();
-        for (String[] image : images) if (seen.add(image[0] + "\n" + image[1])) {
-            String base64 = imageData(image[1], deadline);
-            content.put(new JSONObject().put("type", "text").put("text", image[0]));
+        for (Map.Entry<String, List<String>> image : labelsByUrl.entrySet()) {
+            String label = String.join("、", image.getValue());
+            String base64;
+            try {
+                base64 = imageData(image.getKey(), deadline);
+            } catch (Exception error) {
+                String reason = error instanceof VisibleFailure ? error.getMessage() : "图片下载失败";
+                throw new ModelClient.Failure("图片获取失败", label + "未加载（" + reason + "）", false);
+            }
+            content.put(new JSONObject().put("type", "text").put("text", label));
             content.put(new JSONObject().put("type", "image_url").put("image_url", new JSONObject().put("url", base64)));
         }
         return content;

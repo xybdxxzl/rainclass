@@ -15,7 +15,7 @@ public final class ReviewRegistry {
     public static final class Review {
         public final String id, account, lessonId, course, problemId;
         public volatile int type;
-        public final JSONObject problem;
+        public volatile JSONObject problem;
         public final long receivedAt=System.currentTimeMillis();
         public volatile long questionDeadlineElapsed;
         public volatile JSONArray answers, suggestions=new JSONArray();
@@ -24,6 +24,8 @@ public final class ReviewRegistry {
         public volatile boolean autoSubmit, touched;
         private final Completion completion;
         private boolean finished;
+        private long modelAttempt;
+        private boolean imageRefreshRequested;
         private Review(String account,String lessonId,String course,String problemId,int type,JSONObject problem,
                        JSONArray answers,long deadline,long questionDeadline,Completion completion) {
             this.id=UUID.randomUUID().toString();this.account=account;this.lessonId=lessonId;this.course=course;
@@ -90,21 +92,131 @@ public final class ReviewRegistry {
     }
     /** 暂时为空的输入也算人工接管，避免模型覆盖正在编辑的内容。 */
     public static void touch(String id){Review r=get(id);if(r==null)return;synchronized(r){if(!editable(r))return;r.touched=true;r.autoSubmit=false;}changed(r);}
-    public static boolean beginModel(Review r){
-        synchronized(r){if(!editable(r)||"处理中".equals(r.modelState)||"重试中".equals(r.modelState))return false;
-            r.modelState="处理中";r.modelMessage="可先选择或填写答案";r.modelStartedElapsed=SystemClock.elapsedRealtime();}
-        changed(r);return true;
+    static final class ModelRequest {
+        final JSONObject problem;
+        final int type;
+        final long attempt;
+
+        private ModelRequest(Review review) {
+            problem = review.problem;
+            type = review.type;
+            attempt = review.modelAttempt;
+        }
     }
-    public static boolean applyModel(String id,JSONArray answers,long autoDeadline,boolean allowAuto){
-        Review r=get(id);if(r==null||!validForProblem(r.type,r.problem,answers))return false;
-        synchronized(r){if(!editable(r))return false;r.suggestions=copy(answers);r.modelState="成功";r.modelMessage="模型建议已生成";
-            r.modelDuration=Math.max(0,SystemClock.elapsedRealtime()-r.modelStartedElapsed);
-            if(!r.touched){r.answers=copy(answers);r.deadlineElapsed=autoDeadline;r.autoSubmit=allowAuto&&r.questionDeadlineElapsed!=-2&&autoDeadline>SystemClock.elapsedRealtime();}}
-        changed(r);return true;
+
+    static boolean readyForModel(int type, JSONObject problem) {
+        return (type == 1 || type == 2 || type == 4 || type == 5)
+                && QuestionContent.hasContent(problem) && !problem.optBoolean("_identity_missing")
+                && ((type != 1 && type != 2) || QuestionContent.hasOptions(problem));
     }
-    public static void modelState(Review r,String state,String message){synchronized(r){if(r.finished)return;r.modelState=state;r.modelMessage=message;
-        if("处理中".equals(state))r.modelStartedElapsed=SystemClock.elapsedRealtime();else if(!"重试中".equals(state))r.modelDuration=r.modelStartedElapsed>0?Math.max(0,SystemClock.elapsedRealtime()-r.modelStartedElapsed):0;}
-        changed(r);
+
+    /** 合并晚到的题面并撤销依赖旧图片的模型结果和自动提交。 */
+    static boolean refreshProblem(Review review, JSONObject cached, JSONObject pushed) {
+        boolean startModel;
+        synchronized (review) {
+            if (!editable(review)) return false;
+            JSONObject previous = review.problem;
+            JSONObject problem = QuestionContent.merge(QuestionContent.merge(cached, previous), pushed);
+            int type = problem.optInt("problemType", review.type);
+            boolean wasReady = readyForModel(review.type, previous);
+            boolean ready = readyForModel(type, problem);
+            if (previous.toString().equals(problem.toString()) && type == review.type) return false;
+            boolean imagesChanged = !new QuestionContent(previous).imageReferences()
+                    .equals(new QuestionContent(problem).imageReferences());
+            review.problem = problem;
+            review.type = type;
+            if (imagesChanged || (wasReady && !ready)) {
+                review.modelAttempt++;
+                review.suggestions = new JSONArray();
+                review.autoSubmit = false;
+                if (!review.touched) review.answers = new JSONArray();
+                review.modelState = "未请求";
+                review.modelMessage = "题目图片已更新";
+                review.modelStartedElapsed = review.modelDuration = 0;
+            }
+            startModel = ready && (!wasReady || imagesChanged);
+        }
+        changed(review);
+        return startModel;
+    }
+
+    private static boolean modelProcessing(Review review) {
+        return "处理中".equals(review.modelState) || "重试中".equals(review.modelState);
+    }
+
+    static boolean modelActive(Review review, ModelRequest request) {
+        synchronized (review) {
+            return editable(review) && review.modelAttempt == request.attempt && modelProcessing(review);
+        }
+    }
+
+    static ModelRequest startModel(Review review) {
+        ModelRequest request;
+        synchronized (review) {
+            if (!editable(review) || modelProcessing(review)) return null;
+            review.modelAttempt++;
+            review.modelState = "处理中";
+            review.modelMessage = "可先选择或填写答案";
+            review.modelStartedElapsed = SystemClock.elapsedRealtime();
+            request = new ModelRequest(review);
+        }
+        changed(review);
+        return request;
+    }
+
+    public static boolean beginModel(Review review) {
+        return startModel(review) != null;
+    }
+
+    public static boolean applyModel(String id, JSONArray answers, long autoDeadline, boolean allowAuto) {
+        Review review = get(id);
+        return review != null && applyModel(review, null, answers, autoDeadline, allowAuto);
+    }
+
+    static boolean applyModel(Review review, ModelRequest request, JSONArray answers, long autoDeadline, boolean allowAuto) {
+        synchronized (review) {
+            if (!editable(review) || (request != null && !modelActive(review, request))
+                    || !validForProblem(review.type, review.problem, answers)) return false;
+            review.suggestions = copy(answers);
+            review.modelState = "成功";
+            review.modelMessage = "模型建议已生成";
+            review.modelDuration = Math.max(0, SystemClock.elapsedRealtime() - review.modelStartedElapsed);
+            if (!review.touched) {
+                review.answers = copy(answers);
+                review.deadlineElapsed = autoDeadline;
+                review.autoSubmit = allowAuto && review.questionDeadlineElapsed != -2
+                        && autoDeadline > SystemClock.elapsedRealtime();
+            }
+        }
+        changed(review);
+        return true;
+    }
+
+    static boolean requestImageRefresh(Review review, ModelRequest request) {
+        synchronized (review) {
+            if (!editable(review) || review.modelAttempt != request.attempt || review.imageRefreshRequested) return false;
+            review.imageRefreshRequested = true;
+            return true;
+        }
+    }
+
+    public static void modelState(Review review, String state, String message) {
+        modelState(review, null, state, message);
+    }
+
+    static boolean modelState(Review review, ModelRequest request, String state, String message) {
+        synchronized (review) {
+            if (review.finished || (request != null && !modelActive(review, request))) return false;
+            review.modelState = state;
+            review.modelMessage = message;
+            long now = SystemClock.elapsedRealtime();
+            if ("处理中".equals(state)) review.modelStartedElapsed = now;
+            else if (!"重试中".equals(state)) {
+                review.modelDuration = review.modelStartedElapsed > 0 ? Math.max(0, now - review.modelStartedElapsed) : 0;
+            }
+        }
+        changed(review);
+        return true;
     }
     public static void submission(Review r,String state){synchronized(r){r.submitState=state;}changed(r);}
     public static boolean submit(String id){return finish(id,false,false,"");}

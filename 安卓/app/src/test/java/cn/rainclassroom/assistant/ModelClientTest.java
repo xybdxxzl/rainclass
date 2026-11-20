@@ -25,5 +25,18 @@ public class ModelClientTest {
         JSONObject blanks=new JSONObject().put("blanks",new JSONArray().put("").put(""));
         try{ModelClient.parse("{\"blanks\":[\"甲\"]}",4,blanks);fail("blank count");}catch(ModelClient.Failure expected){assertTrue(expected.getMessage().contains("空数"));}
     }
+
+    @Test public void distinguishesUnreadableImageFromAnIndeterminateAnswer() throws Exception {
+        JSONObject question = new JSONObject().put("body", "<img src='/image.png'>")
+                .put("blanks", new JSONArray().put(""));
+        try {
+            ModelClient.parse("{\"blanks\":[\"无法确定\"]}", 4, question);
+            fail("应标记题图未读清");
+        } catch (ModelClient.Failure failure) {
+            assertEquals("图片未读清", failure.state);
+        }
+        assertEquals("无法确定", ModelClient.parse(
+                "{\"image_unreadable\":false,\"blanks\":[\"无法确定\"]}", 4, question).getString(0));
+    }
 }
 

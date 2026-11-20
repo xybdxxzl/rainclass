@@ -65,5 +65,57 @@ public class ImmediateQuestionTest {
         assertEquals("待作答",stored.getString("state"));assertEquals("请选择",stored.getJSONObject("problem").getString("body"));
         assertFalse(stored.has("api_key"));assertFalse(stored.has("sessionid"));
     }
+
+    @Test public void cachedImagesSurvivePartialPushForStemAndMatchingOption() throws Exception {
+        JSONObject cached = new JSONObject()
+                .put("problemType", 1).put("body", "课件题干<img src='/stem.png'>")
+                .put("options", new JSONArray()
+                        .put(new JSONObject().put("key", "A").put("value", "甲")
+                                .put("images", new JSONArray().put(new JSONObject().put("src", "/a.png"))))
+                        .put(new JSONObject().put("key", "B").put("value", "乙")));
+        JSONObject pushed = new JSONObject().put("body", "更新后的题干").put("images", new JSONArray())
+                .put("options", new JSONArray()
+                        .put(new JSONObject().put("key", "B").put("value", "新乙"))
+                        .put(new JSONObject().put("key", "A").put("value", "新甲").put("images", new JSONArray())));
+        JSONObject merged = QuestionContent.merge(cached, pushed);
+        QuestionContent question = new QuestionContent(merged);
+        assertEquals("更新后的题干", question.stem.html);
+        assertEquals("新甲", question.options.get("A").html);
+        assertTrue(question.imageReferences().get("题干图片").contains("https://www.yuketang.cn/stem.png"));
+        assertTrue(question.imageReferences().get("选项A图片").contains("https://www.yuketang.cn/a.png"));
+        assertFalse(question.imageReferences().containsKey("选项B图片"));
+    }
+
+    @Test public void lateImageCancelsOldModelAttemptAndKeepsManualDraft() throws Exception {
+        ReviewRegistry.Review review = received((r, cancelled) -> {});
+        ReviewRegistry.ModelRequest first = ReviewRegistry.startModel(review);
+        assertNotNull(first);
+        assertTrue(ReviewRegistry.updateDraft(review.id, array("A")));
+        JSONObject photo = new JSONObject().put("images", new JSONArray().put("/stem.png"));
+        assertTrue(ReviewRegistry.refreshProblem(review, null, photo));
+        assertFalse(ReviewRegistry.refreshProblem(review, null, photo));
+        assertFalse(ReviewRegistry.applyModel(review, first, array("A"), Long.MAX_VALUE, true));
+        assertFalse(ReviewRegistry.modelState(review, first, "超时", "旧请求"));
+        ReviewRegistry.ModelRequest current = ReviewRegistry.startModel(review);
+        assertNotNull(current);
+        assertTrue(ReviewRegistry.applyModel(review, current, array("B"), Long.MAX_VALUE, true));
+        assertEquals("A", review.answers.getString(0));
+        assertEquals("B", review.suggestions.getString(0));
+        assertFalse(review.autoSubmit);
+    }
+
+    @Test public void pictureUpdateRevokesAutomaticSubmissionOfEarlierSuggestion() throws Exception {
+        ReviewRegistry.Review review = received((r, cancelled) -> {});
+        ReviewRegistry.ModelRequest first = ReviewRegistry.startModel(review);
+        assertTrue(ReviewRegistry.applyModel(review, first, array("A"), Long.MAX_VALUE, true));
+        assertTrue(review.autoSubmit);
+        String stem = review.problem.getString("body");
+        JSONObject late = new JSONObject().put("body", "<img src='/late.png' alt='补图'>");
+        assertTrue(ReviewRegistry.refreshProblem(review, null, late));
+        assertEquals(stem, review.problem.getString("body"));
+        assertFalse(review.autoSubmit);
+        assertEquals(0, review.answers.length());
+        assertEquals(0, review.suggestions.length());
+    }
 }
 

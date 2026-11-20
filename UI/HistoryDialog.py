@@ -8,7 +8,8 @@ from UI.Typography import reading_text
 
 
 MODEL_STATES = {'not_requested':'尚未请求模型', 'pending':'等待模型处理', 'processing':'模型处理中', 'retrying':'模型正在重试',
-                'success':'模型已生成建议', 'timeout':'模型超时', 'failed':'模型失败', 'disabled':'模型未开启', 'cancelled':'模型处理已结束'}
+                'success':'模型已生成建议', 'timeout':'模型超时', 'failed':'模型失败', 'disabled':'模型未开启',
+                'image_unavailable':'题目图片未加载', 'image_unreadable':'模型未读清图片', 'cancelled':'模型处理已结束'}
 SUBMISSION_STATES = {'waiting':'未提交', 'submitting':'正在提交', 'submitted':'提交成功', 'failed':'提交失败', 'unknown':'提交结果未知，请在雨课堂核对',
                      'cancelled':'已取消', 'expired':'题目已截止'}
 

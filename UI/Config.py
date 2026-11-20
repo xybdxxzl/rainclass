@@ -196,8 +196,13 @@ class Config_Ui:
         self.test_button = QtWidgets.QPushButton('测试大模型连接')
         self.test_button.setEnabled(not preview)
         self.test_button.setToolTip('使用当前填写的配置发送一次最小模型请求，会产生少量调用费用。')
-        self.test_button.clicked.connect(self.start_connection_test)
+        self.test_button.clicked.connect(lambda: self.start_connection_test())
         test_row.addWidget(self.test_button)
+        self.test_vision_button = QtWidgets.QPushButton('测试图片题')
+        self.test_vision_button.setEnabled(not preview)
+        self.test_vision_button.setToolTip('用一张本地生成的测试图片检查图片题模型，会产生少量调用费用。')
+        self.test_vision_button.clicked.connect(lambda: self.start_connection_test(vision=True))
+        test_row.addWidget(self.test_vision_button)
         test_row.addStretch()
         layout.addLayout(test_row)
         self.test_result = self.hint('尚未测试 · 使用当前填写的地址、密钥和模型，无需先保存。')
@@ -526,9 +531,11 @@ class Config_Ui:
         if hasattr(self, 'test_result'):
             self.test_result.setText('配置已变更，请重新测试。' if not self.loading else '尚未测试 · 使用当前填写的配置，无需先保存。')
             self.test_button.setText('测试大模型连接')
+            self.test_vision_button.setText('测试图片题')
             self.test_button.setEnabled(not self.preview_mode)
+            self.test_vision_button.setEnabled(not self.preview_mode)
 
-    def start_connection_test(self):
+    def start_connection_test(self, vision=False):
         if self.preview_mode or self._test_running:
             return
         profile = self.profile()
@@ -544,15 +551,18 @@ class Config_Ui:
         generation = self._test_generation
         self._test_running = True
         self.test_button.setEnabled(False)
-        self.test_button.setText('正在测试…')
-        self.test_result.setText('正在请求模型 %s，测试不会提交任何课堂答案。' % profile['model'])
+        self.test_vision_button.setEnabled(False)
+        button = self.test_vision_button if vision else self.test_button
+        button.setText('正在测试…')
+        selected = (profile.get('vision_model') or profile['model']) if vision else profile['model']
+        self.test_result.setText('正在用 %s 测试%s。' % (selected, '图片题' if vision else '文字题'))
         signal = self._test_signals
         def run():
             try:
                 from Scripts.LLM import test_connection
-                result = test_connection(profile)
+                result = test_connection(profile, vision=True) if vision else test_connection(profile)
             except Exception:
-                result = {'ok': False, 'message': '连接测试失败，请检查配置后重试。', 'model': profile['model']}
+                result = {'ok': False, 'message': '连接测试失败，请检查配置后重试。', 'model': selected}
             try:
                 signal.completed.emit(generation, result)
             except RuntimeError:
@@ -564,7 +574,9 @@ class Config_Ui:
             return
         self._test_running = False
         self.test_button.setEnabled(not self.preview_mode)
-        self.test_button.setText('重新测试连接')
+        self.test_vision_button.setEnabled(not self.preview_mode)
+        self.test_button.setText('测试大模型连接')
+        self.test_vision_button.setText('测试图片题')
         stamp = datetime.datetime.now().strftime('%H:%M:%S')
         latency = result.get('latency_ms')
         elapsed = ' · %.2f 秒' % (latency / 1000) if isinstance(latency, (int,float)) else ''

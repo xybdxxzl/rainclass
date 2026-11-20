@@ -15,6 +15,10 @@ public final class ModelClient {
         public final String state;public final boolean retry;
         Failure(String state,String message,boolean retry){super(message);this.state=state;this.retry=retry;}
     }
+    private static final String IMAGE_PROMPT =
+            "先读题图和选项图的关键文字、数字和标注。若有关键图像信息看不清，输出 image_unreadable 为 true、答案字段留空。"
+            + "图像清晰时输出 image_unreadable 为 false。若根据题意本身无法确定，使用正常答案格式。";
+
     private ModelClient(){}
     public static String normalize(String base){String out=base.trim().replaceAll("/+$","");return out.endsWith("/chat/completions")?out.substring(0,out.length()-17):out;}
     public static JSONArray complete(OkHttpClient http,String base,String key,String model,JSONArray content,int type,JSONObject problem,
@@ -24,7 +28,15 @@ public final class ModelClient {
         if(!"https".equalsIgnoreCase(endpoint.getScheme())||endpoint.getHost()==null||endpoint.getUserInfo()!=null||endpoint.getQuery()!=null||endpoint.getFragment()!=null)
             throw new Failure("失败","模型接口必须是有效 HTTPS 地址",false);
         if(key.trim().isEmpty()||model.trim().isEmpty()||key.matches(".*\\s+.*")||model.matches(".*\\s+.*"))throw new Failure("失败","请填写有效的 API Key 和模型名称",false);
-        String system="你是一名答题助手，根据题目和选项作答，只输出 JSON。单选或多选：{\"choices\":[\"A\"]}；填空：{\"blanks\":[\"答案\"]}；简答：{\"answer\":\"答案\"}。图片属于题目的一部分。";
+        String system="你是一名答题助手，根据题目和选项作答，只输出 JSON。单选或多选：{\"choices\":[\"A\"]}；填空：{\"blanks\":[\"答案\"]}；简答：{\"answer\":\"答案\"}。";
+        boolean hasImages = false;
+        for (int i = 0; i < content.length(); i++) {
+            if ("image_url".equals(content.getJSONObject(i).optString("type"))) {
+                hasImages = true;
+                break;
+            }
+        }
+        if (hasImages) system += IMAGE_PROMPT;
         JSONObject payload=new JSONObject().put("model",model.trim()).put("temperature",0).put("messages",new JSONArray()
             .put(new JSONObject().put("role","system").put("content",system)).put(new JSONObject().put("role","user").put("content",content)));
         Request request=new Request.Builder().url(endpoint.toURL()).header("Authorization","Bearer "+key.trim()).post(RequestBody.create(payload.toString(),JSON)).build();
@@ -41,7 +53,7 @@ public final class ModelClient {
                     if(SystemClock.elapsedRealtime()>=deadline)throw new Failure("超时","模型已超过总等待上限",false);
                     JSONObject result=new JSONObject(raw);
                     String text=result.getJSONArray("choices").getJSONObject(0).getJSONObject("message").optString("content","");
-                    return parse(text,type,problem);
+                    return parse(text, type, problem, hasImages);
                 }
             }catch(Failure e){last=e;if(!e.retry)throw e;}
             catch(JSONException e){throw new Failure("失败","模型返回格式异常",false);}
@@ -61,17 +73,58 @@ public final class ModelClient {
         if(code>=500)return new Failure("失败","模型服务暂时不可用（HTTP "+code+"）",true);
         return new Failure("失败","模型接口拒绝请求（HTTP "+code+"）",false);
     }
-    static JSONArray parse(String text,int type,JSONObject problem)throws Exception{
-        int first=text.indexOf('{'),last=text.lastIndexOf('}');
-        if(first<0||last<first)throw new Failure("失败","模型返回格式异常",false);
-        JSONObject value;
-        try{value=new JSONObject(text.substring(first,last+1));}catch(JSONException e){throw new Failure("失败","模型返回格式异常",false);}
-        JSONArray source=type==5?new JSONArray().put(value.optString("answer","").trim()):value.optJSONArray(type==4?"blanks":"choices");
-        if(!ReviewRegistry.valid(type,source))throw new Failure("失败","模型未返回有效答案",false);
-        JSONArray out=new JSONArray();for(int i=0;i<source.length();i++){String s=source.getString(i).trim();out.put(type==1||type==2?s.toUpperCase(java.util.Locale.ROOT):s);}
-        if(!ReviewRegistry.validForProblem(type,problem,out))throw new Failure("失败","模型答案与题目选项或空数不匹配",false);
+    static JSONArray parse(String text, int type, JSONObject problem) throws JSONException, Failure {
+        return parse(text, type, problem, !new QuestionContent(problem).imageReferences().isEmpty());
+    }
+
+    private static JSONArray parse(String text, int type, JSONObject problem, boolean hasImages)
+            throws JSONException, Failure {
+        int first = text.indexOf('{'), last = text.lastIndexOf('}');
+        if (first < 0 || last < first) {
+            if (hasImages && genericUncertainty(text)) throw unreadableImage();
+            throw new Failure("失败", "模型返回格式异常", false);
+        }
+        JSONObject value = new JSONObject(text.substring(first, last + 1));
+        JSONArray source = type == 5 ? new JSONArray().put(value.optString("answer", "").trim())
+                : value.optJSONArray(type == 4 ? "blanks" : "choices");
+        if (hasImages) {
+            Object unreadable = value.opt("image_unreadable");
+            if (Boolean.TRUE.equals(unreadable)) throw unreadableImage();
+            if (!Boolean.FALSE.equals(unreadable) && source != null) {
+                for (int i = 0; i < source.length(); i++) {
+                    if (genericUncertainty(source.optString(i))) throw unreadableImage();
+                }
+            }
+        }
+        if (!ReviewRegistry.valid(type, source)) throw new Failure("失败", "模型未返回有效答案", false);
+        JSONArray out = new JSONArray();
+        for (int i = 0; i < source.length(); i++) {
+            String answer = source.getString(i).trim();
+            out.put(type == 1 || type == 2 ? answer.toUpperCase(java.util.Locale.ROOT) : answer);
+        }
+        if (!ReviewRegistry.validForProblem(type, problem, out)) {
+            throw new Failure("失败", "模型答案与题目选项或空数不匹配", false);
+        }
         return out;
     }
+
+    private static boolean genericUncertainty(String answer) {
+        switch (answer.trim().replaceAll("[。.!！]+$", "")) {
+            case "无法确定":
+            case "无法判断":
+            case "无法识别":
+            case "图片看不清":
+            case "看不清图片":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static Failure unreadableImage() {
+        return new Failure("图片未读清", "模型未能读清题图，请核对原图后手动作答", false);
+    }
+
     public static void test(String base,String key,String model,int seconds)throws Exception{
         JSONObject p=new JSONObject().put("body","请选择字母 A").put("options",new JSONArray().put(new JSONObject().put("key","A").put("value","A")));
         JSONArray content=new JSONArray().put(new JSONObject().put("type","text").put("text","请选择 A，只输出 {\"choices\":[\"A\"]}。"));

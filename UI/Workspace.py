@@ -4,14 +4,14 @@ import math
 import threading
 import time
 from PyQt5 import QtCore, QtWidgets
-from Scripts.LLM import ask_llm, route_config, strip_html, has_images, stream_explanation
+from Scripts.LLM import ask_llm, strip_html, has_images, stream_explanation
 from Scripts.Providers import PRESETS
 from UI.Components import ElidingLabel, ToggleSwitch, repolish
 from UI.Typography import reading_text
 
 
 class Workspace(QtWidgets.QWidget):
-    recomputed = QtCore.pyqtSignal(object, object, int)
+    recomputed = QtCore.pyqtSignal(object, object, int, int)
     failed = QtCore.pyqtSignal(str)
     detail_chunk = QtCore.pyqtSignal(object, str)
     detail_done = QtCore.pyqtSignal(object, object)
@@ -30,6 +30,7 @@ class Workspace(QtWidgets.QWidget):
         self.recomputing = False
         self.streaming = False
         self.detail_review = None
+        self.detail_question_revision = None
         self._last_display = None
         self._editor_review = None
         self._editor_signature = None
@@ -438,9 +439,6 @@ class Workspace(QtWidgets.QWidget):
         review = self.pending.itemData(index)
         self.active = review
         if review:
-            self.question_type.setText({1:'单选题', 2:'多选题', 4:'填空题', 5:'简答题'}.get(review.problemtype, '待识别'))
-            self.image_hint.setVisible(has_images(review.problem))
-            self.image_hint.setText('含图片，请在雨课堂核对原图')
             self.pending_question = None
             self.show_question({'course': review.course, 'problem': review.problem, 'type': review.problemtype})
             self.show_result(review)
@@ -473,11 +471,14 @@ class Workspace(QtWidgets.QWidget):
             repolish(self.answer)
 
     def show_result(self, review):
-        signature = (id(review), tuple(review.answers), review.revision, getattr(review, 'llm_state', ''),
+        signature = (id(review), id(review.problem), tuple(review.answers), review.revision, getattr(review, 'llm_state', ''),
                      getattr(review, 'status', ''), repr(review.result))
         if self._last_display == signature:
             return
         self._last_display = signature
+        self.image_hint.setVisible(has_images(review.problem))
+        self.image_hint.setText('含图片，请在雨课堂核对原图')
+        self.question_type.setText({1:'单选题', 2:'多选题', 4:'填空题', 5:'简答题'}.get(review.problemtype, '待识别'))
         text_answer = '、'.join(map(str, review.answers))
         self.set_answer_mode('status' if not text_answer else 'text' if review.problemtype in (4, 5) or len(text_answer) > 12 else 'choice')
         self.answer.setText(text_answer or '尚未选择答案')
@@ -657,11 +658,14 @@ class Workspace(QtWidgets.QWidget):
         self.recalculate.setEnabled(active and not self.recomputing and not processing)
         self.recalculate.setText('计算中…' if self.recomputing or processing else '重新计算')
         self.use_suggestion.setEnabled(bool(active and review.result.get('answers')))
-        self.retry_question.setVisible(bool(review and not getattr(review, 'can_answer', True)))
+        needs_refetch = review and (not getattr(review, 'can_answer', True) or llm_state == 'image_unavailable')
+        self.retry_question.setVisible(bool(needs_refetch))
         self.retry_question.setEnabled(bool(review and not review.event.is_set() and callable(getattr(review, 'retry_question', None))))
         if review:
             state_text = {'not_requested':'尚未请求模型', 'pending':'等待模型处理', 'processing':'模型处理中', 'retrying':'模型正在重试', 'success':'模型已生成建议',
-                          'timeout':'模型已超时', 'failed':'模型请求失败', 'disabled':'模型答题未开启', 'cancelled':'本题模型处理已结束'}.get(llm_state, '模型状态待确认')
+                          'timeout':'模型已超时', 'failed':'模型请求失败', 'disabled':'模型答题未开启',
+                          'image_unavailable':'题目图片未加载', 'image_unreadable':'模型未读清图片',
+                          'cancelled':'本题模型处理已结束'}.get(llm_state, '模型状态待确认')
             started = getattr(review, 'llm_started', None)
             elapsed = max(0, int(now - started)) if isinstance(started, (int,float)) and started else 0
             deadline = getattr(review, 'llm_deadline', None)
@@ -692,6 +696,9 @@ class Workspace(QtWidgets.QWidget):
                     self.progress.setValue(max(0,min(100,int(remaining/limit*100))))
                     self.set_timer_urgent(remaining <= 10)
             return
+        if self.detail_review is review and self.detail_question_revision != review.question_revision:
+            self.detail_review = None
+            self.detail_output.clear()
         if not self.recomputing:
             self.show_result(review)
         if not active:
@@ -735,24 +742,26 @@ class Workspace(QtWidgets.QWidget):
         if budget is not None and budget <= 1:
             self.ui.add_message_signal.emit('题目剩余时间不足，无法重算', 0)
             return
-        revision = review.revision
-        cfg = route_config(review.problem, self.ui.config.get('llm_config', {}))
+        with review.lock:
+            revision, question_revision = review.revision, review.question_revision
+            problem, problemtype = review.problem, review.problemtype
+        cfg = dict(self.ui.config.get('llm_config', {}))
         self.recomputing = True
         self.explanation.setPlainText('正在用当前模型重算；原倒计时仍在运行。')
         def run():
             try:
-                result = ask_llm(review.problem, review.problemtype, cfg, time_budget=budget, return_details=True)
+                result = ask_llm(problem, problemtype, cfg, time_budget=budget, return_details=True)
                 if not result:
                     raise ValueError('模型未返回有效答案')
-                self.recomputed.emit(review, result, revision)
+                self.recomputed.emit(review, result, revision, question_revision)
             except Exception as e:
                 self.failed.emit('重算失败：%s' % e)
         threading.Thread(target=run, daemon=True).start()
 
-    def apply_recomputed(self, review, result, revision):
+    def apply_recomputed(self, review, result, revision, question_revision):
         self.recomputing = False
         self.update_metrics({'result': result})
-        if review.update_if_unchanged(result['answers'], result, revision):
+        if review.update_if_unchanged(result['answers'], result, revision, question_revision=question_revision):
             dialog = self.ui.review_dialog_for(review)
             if dialog:
                 dialog.set_answers(result['answers'])
@@ -772,15 +781,18 @@ class Workspace(QtWidgets.QWidget):
         review = self.active
         if not review or self.streaming:
             return
-        cfg = route_config(review.problem, self.ui.config.get('llm_config', {}))
+        cfg = dict(self.ui.config.get('llm_config', {}))
         question = self.detail_question.text().strip()
-        answers = list(review.answers)
+        with review.lock:
+            problem, problemtype = review.problem, review.problemtype
+            answers = list(review.answers)
+            self.detail_question_revision = review.question_revision
         self.detail_review = review
         self.detail_output.clear()
         self.streaming = True
         def run():
             try:
-                result = stream_explanation(review.problem, review.problemtype, answers, cfg, question,
+                result = stream_explanation(problem, problemtype, answers, cfg, question,
                                             lambda chunk: self.detail_chunk.emit(review,chunk))
                 self.detail_done.emit(review,result)
             except Exception as e:
@@ -788,7 +800,8 @@ class Workspace(QtWidgets.QWidget):
         threading.Thread(target=run, daemon=True).start()
 
     def show_detail_chunk(self, review, chunk):
-        if self.active is review and self.detail_review is review:
+        if (self.active is review and self.detail_review is review
+                and self.detail_question_revision == review.question_revision):
             self.detail_output.moveCursor(__import__('PyQt5.QtGui',fromlist=['QTextCursor']).QTextCursor.End)
             self.detail_output.insertPlainText(chunk)
             self.detail_output.ensureCursorVisible()
@@ -796,12 +809,14 @@ class Workspace(QtWidgets.QWidget):
     def finish_detail(self, review, result):
         self.streaming = False
         self.update_metrics({'result':result})
-        self.ui.add_message_signal.emit('详细解析已生成；本次请求不会修改答案', 0)
+        if self.detail_review is review and self.detail_question_revision == review.question_revision:
+            self.ui.add_message_signal.emit('详细解析已生成', 0)
 
     def fail_detail(self, review, error):
         self.streaming = False
         self.update_metrics({'unknown':1})
-        if self.active is review:
+        if (self.active is review and self.detail_review is review
+                and self.detail_question_revision == review.question_revision):
             self.detail_output.appendPlainText('\n请求失败：' + error)
         self.ui.add_message_signal.emit('详细解析请求失败：' + error, 0)
 

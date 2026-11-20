@@ -11,7 +11,7 @@ from Scripts.Classes import Lesson
 from Scripts.AnswerReview import AnswerReview, review_seconds
 from Scripts.History import HistoryStore
 from Scripts.Utils import get_initial_data
-from Scripts.LLM import bounded_call, test_connection as check_connection
+from Scripts.LLM import ImageLoadError, _build_user_content, bounded_call, has_images, test_connection as check_connection
 
 
 class DeadlineTests(unittest.TestCase):
@@ -107,6 +107,93 @@ class DeadlineTests(unittest.TestCase):
         self.ui.review_answer_signal.emit.assert_called_once()
         self.assertEqual(len(self.ui.history_store.list('account-a')), 1)
 
+    @patch('Scripts.LLM._download_image_b64', return_value='data:image/png;base64,YQ==')
+    def test_cached_stem_and_option_images_survive_text_update(self, download):
+        self.lesson.problems_dict['with-images'] = {
+            **self.problem,
+            'body': '课件题干<img src="/stem.png">',
+            'options': [{'key': 'A', 'value': '甲<img src="/a.png">'}, {'key': 'B', 'value': '乙'}],
+        }
+        updated = {**self.problem, 'body': '更新的文字题干', 'options': [
+            {'key': 'B', 'value': '新乙'}, {'key': 'A', 'value': '新甲'},
+        ]}
+        review = self.lesson.start_answer('with-images', 120, updated)
+        content = _build_user_content(review.problem, review.problemtype)
+        self.assertIn('更新的文字题干', content[0]['text'])
+        self.assertIn('A. 新甲', content[0]['text'])
+        self.assertEqual([part['text'] for part in content[1:] if part['type'] == 'text'], ['题干图片', '选项A图片'])
+        self.assertEqual({call.args[0].rsplit('/', 1)[-1] for call in download.call_args_list}, {'stem.png', 'a.png'})
+
+    def test_late_cached_image_invalidates_pending_text_answer_and_keeps_draft(self):
+        self.ui.config['llm_config'].update(enabled=True, api_key='test')
+        entered, release = threading.Event(), threading.Event()
+
+        def model(problem, *_args, **_kwargs):
+            if has_images(problem):
+                return {'answers': ['B']}
+            entered.set()
+            release.wait(2)
+            return {'answers': ['A']}
+
+        with patch('Scripts.Classes.ask_llm', side_effect=model) as mocked:
+            try:
+                review = self.lesson.start_answer('late', 120, self.problem)
+                self.assertTrue(entered.wait(1))
+                self.assertTrue(review.update(['A']))
+                photo = {'problemId': 'late', **self.problem, 'images': [{'url': '/late.png'}]}
+                with patch.object(self.lesson, 'get_problems', return_value=[photo]):
+                    self.lesson._cache_problems('page')
+                    self.wait_for(lambda: review.result.get('answers') == ['B'])
+                    self.lesson._cache_problems('page')
+                self.assertIs(self.lesson.start_answer('late', 120, self.problem), review)
+                self.assertEqual(review.answers, ['A'])
+                self.assertFalse(review.auto_submit)
+                self.assertFalse(review.apply_model({'answers': ['A']}, 0, 10, question_revision=0))
+                self.assertEqual(mocked.call_count, 2)
+                self.lesson.answer_questions.assert_not_called()
+            finally:
+                release.set()
+
+    def test_late_image_clears_auto_submission_from_old_suggestion(self):
+        self.ui.config['llm_config'].update(enabled=True, api_key='test')
+        release = threading.Event()
+
+        def model(problem, *_args, **_kwargs):
+            if has_images(problem):
+                release.wait(2)
+                return {'answers': ['B']}
+            return {'answers': ['A']}
+
+        with patch('Scripts.Classes.ask_llm', side_effect=model):
+            try:
+                review = self.lesson.start_answer('late-image-only', 120, self.problem)
+                self.wait_for(lambda: review.auto_submit)
+                self.lesson.start_answer('late-image-only', 120, {
+                    'body': '<img src="/late.png" alt="插图">',
+                })
+                self.assertEqual(review.problem['body'], self.problem['body'])
+                self.assertFalse(review.auto_submit)
+                self.assertFalse(review.valid_input)
+                self.assertEqual(review.result, {})
+                self.assertEqual(review.answers, [])
+                self.lesson.answer_questions.assert_not_called()
+            finally:
+                release.set()
+            self.wait_for(lambda: review.result.get('answers') == ['B'])
+
+    def test_missing_picture_requests_problem_details_once(self):
+        self.ui.config['llm_config'].update(enabled=True, api_key='test')
+        self.lesson.wsapp = Mock()
+        with patch('Scripts.Classes.ask_llm', side_effect=ImageLoadError('选项A图片未加载')):
+            review = self.lesson.start_answer('missing-image', 120, self.problem)
+            self.wait_for(lambda: self.lesson.wsapp.send.called and review.model_running_revision is None)
+            self.assertEqual(review.llm_state, 'image_unavailable')
+            self.assertIn('选项A', review.llm_error)
+            self.assertTrue(review.can_answer)
+            review.retry_model()
+            self.wait_for(lambda: review.model_running_revision is None)
+            self.lesson.wsapp.send.assert_called_once()
+
     def test_expired_question_is_kept_but_never_submitted(self):
         review = self.lesson.start_answer('expired', 0, self.problem)
         self.assertTrue(review.event.is_set())
@@ -157,9 +244,7 @@ class DeadlineTests(unittest.TestCase):
         self.assertFalse(review.finish())
         self.lesson.answer_questions.assert_not_called()
 
-    def test_failure_hint_and_review_budget(self):
-        self.lesson._llm_fallback_hint(120, elapsed=8)
-        self.assertIn('112秒', self.lesson.add_message.call_args.args[0])
+    def test_review_budget(self):
         self.assertEqual(review_seconds(120, 5), 15)
         self.assertEqual(review_seconds(10, 8), 0)
 

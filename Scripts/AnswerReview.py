@@ -20,6 +20,9 @@ class AnswerReview:
         self.question_deadline = question_deadline
         self.result = result or {}
         self.revision = 0
+        self.question_revision = 0
+        self.model_running_revision = None
+        self.image_refresh_requested = False
         self.valid_input = bool(self.answers)
         self.account_id, self.lesson_id, self.problem_id = str(account_id), str(lesson_id), str(problem_id)
         self.id = hashlib.sha256(('%s|%s|%s' % (account_id, lesson_id, problem_id)).encode()).hexdigest() if problem_id else uuid.uuid4().hex
@@ -42,11 +45,16 @@ class AnswerReview:
         if self.on_change is not None:
             self.on_change(self)
 
-    def set_state(self, **fields):
+    def set_state(self, *, question_revision=None, while_processing=False, **fields):
         with self.lock:
+            if question_revision is not None and (self.event.is_set() or self.question_revision != question_revision):
+                return False
+            if while_processing and self.llm_state not in ('processing', 'retrying'):
+                return False
             for key, value in fields.items():
                 setattr(self, key, value)
         self.persist()
+        return True
 
     def update(self, answers):
         with self.lock:
@@ -79,9 +87,10 @@ class AnswerReview:
         self.persist()
         return True
 
-    def apply_model(self, result, revision, seconds):
+    def apply_model(self, result, revision, seconds, *, question_revision=None):
         with self.lock:
-            if self.event.is_set() or (self.question_deadline is not None and time.monotonic() >= self.question_deadline):
+            if (self.event.is_set() or (question_revision is not None and self.question_revision != question_revision)
+                    or (self.question_deadline is not None and time.monotonic() >= self.question_deadline)):
                 return False
             self.result = result
             self.llm_state = 'success'
@@ -96,9 +105,10 @@ class AnswerReview:
         self.persist()
         return True
 
-    def update_if_unchanged(self, answers, result, revision):
+    def update_if_unchanged(self, answers, result, revision, *, question_revision=None):
         with self.lock:
             if (self.event.is_set() or self.revision != revision or not self.valid_input
+                    or (question_revision is not None and self.question_revision != question_revision)
                     or (self.problemtype == 4 and self.answers and len(answers) != len(self.answers))):
                 return False
             self.answers = list(answers)

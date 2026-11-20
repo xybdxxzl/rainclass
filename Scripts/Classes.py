@@ -7,7 +7,8 @@ import json
 import uuid
 import math
 from Scripts.Utils import get_user_info, dict_result, calculate_waittime
-from Scripts.LLM import ask_llm, route_config, bounded_call, classify_error
+from Scripts.LLM import ImageLoadError, ask_llm, bounded_call, classify_error
+from Scripts.Question import merge_problem, image_signature
 from Scripts.AnswerReview import AnswerReview, review_seconds
 from Scripts.History import HistoryStore
 
@@ -87,9 +88,10 @@ class Lesson:
         # 注意：课件中的answers字段不再用于答案匹配，一切答案均由大模型生成
         self.presentation_ids.add(presentationid)
         for problem in self.get_problems(presentationid):
-            self.problems_dict[str(problem["problemId"])] = problem
-        for review in list(self.reviews.values()):
-            if not review.can_answer and not review.event.is_set():
+            problem_id = str(problem["problemId"])
+            self.problems_dict[problem_id] = problem
+            review = self.reviews.get(problem_id)
+            if review is not None:
                 self._refresh_question(review, {})
 
     def _cache_async(self, presentationid):
@@ -103,26 +105,12 @@ class Lesson:
                         review.set_state(status='已收到题目，题面获取失败，可重新获取')
         threading.Thread(target=work, daemon=True).start()
 
-    def _extract_problem(self,data,problemid):
-        # 合并WebSocket报文与课件缓存，得到统一的题目结构
-        # WS推送/回包很可能只有sid+limit，题面以课件缓存为准；WS若带了更全的字段则优先
-        ws = data.get("problem") if isinstance(data.get("problem"),dict) else data
+    def _extract_problem(self, data, problemid, previous=None):
+        pushed = data.get("problem") if isinstance(data.get("problem"), dict) else data
         cached = self.problems_dict.get(str(problemid), self.problems_dict.get(problemid, {}))
-
-        def pick(key):
-            for src in (ws,cached):
-                value = src.get(key)
-                if value:
-                    return value
-            return None
-
-        return {
-            "problemType": pick("problemType") or pick("type"),
-            "body": pick("body") or pick("content") or pick("title") or "",
-            "options": pick("options") or [],
-            "blanks": pick("blanks") or [],
-            "images": pick("images") or [],
-        }
+        if previous is not None:
+            cached = merge_problem(cached, previous)
+        return merge_problem(cached, pushed)
 
     def answer_questions(self,problemid,problemtype,answer,limit,elapsed=0,immediate=False):
         # 回答问题
@@ -300,84 +288,106 @@ class Lesson:
                 self.add_message(meg,0)
                 self.start_answer(problemid, 0, problem=self._extract_problem(data, problemid))
 
-    def _llm_fallback_hint(self, limit, elapsed=0):
-        # 找不到答案时的原有提示
-        if limit == -1:
-            meg = "%s的问题没有找到答案，该题不限时，请尽快前往雨课堂回答" % (self.lessonname)
-        elif limit <= elapsed:
-            meg = "%s题目已超时，未提交答案，请前往雨课堂查看" % self.lessonname
-        else:
-            meg = "%s的问题没有找到答案，请在%s秒内前往雨课堂回答" % (self.lessonname,max(0, int(limit - elapsed)))
-        self.add_message(meg,4)
+    def _answer_by_llm(self, review, problem, problemtype, question_revision):
+        # 人工提交独立进行。题面补图后，旧请求的状态和结果均失效。
+        def active():
+            return (self._running() and not review.event.is_set()
+                    and review.question_revision == question_revision)
 
-    def _answer_by_llm(self, problem, problemid, problemtype, limit, review=None):
-        # 作答上下文已提前存在；此线程只生成建议，不等候人工提交。
-        review = review or self.reviews.get(str(problemid))
-        if review is None or review.event.is_set() or not review.can_answer:
+        if not active():
             return
-        llm_cfg = route_config(problem, self.config.get('llm_config', {}))
+        llm_cfg = dict(self.config.get('llm_config', {}))
         if not llm_cfg.get('enabled') or not self.config.get('auto_answer', True):
-            review.set_state(llm_state='disabled', status='模型答题未开启，可直接手动作答')
+            review.set_state(question_revision=question_revision, llm_state='disabled',
+                             status='模型答题未开启，可直接手动作答')
             return
-        if not all(str(llm_cfg.get(key) or '').strip() for key in ('base_url', 'api_key', 'model')):
-            review.set_state(llm_state='failed', llm_error='模型配置不完整，请检查接口地址、密钥和模型名称', status='模型配置不完整，可继续手动作答')
+        if (not all(str(llm_cfg.get(key) or '').strip() for key in ('base_url', 'api_key'))
+                or not (llm_cfg.get('model') or llm_cfg.get('vision_model'))):
+            review.set_state(question_revision=question_revision, llm_state='failed',
+                             llm_error='模型配置不完整，请检查接口地址、密钥和模型名称',
+                             status='模型配置不完整，可继续手动作答')
             return
+
         with review.lock:
-            if review.llm_state in ('processing', 'retrying'):
+            if not active() or not review.can_answer:
                 return
             revision = review.revision
             budget = max(1, min(600, float(llm_cfg.get('total_timeout', llm_cfg.get('timeout', 30)))))
-            if review.question_deadline is not None:
-                budget = min(budget, max(0, review.question_deadline - time.monotonic() - 5))
             review.llm_started = time.monotonic()
-            review.llm_deadline = review.llm_started + budget
+            if review.question_deadline is not None:
+                budget = min(budget, max(0, review.question_deadline - review.llm_started - 5))
+            deadline = review.llm_deadline = review.llm_started + budget
             review.llm_state = 'processing'
-            review.status = '题目已收到，可立即作答；模型处理中'
+            review.status = '题目已收到，可立即作答，模型处理中'
             review.llm_error = ''
         review.persist()
         if budget <= 0:
-            review.set_state(llm_state='timeout', status='剩余时间不足以请求模型，请立即手动作答')
+            review.set_state(question_revision=question_revision, llm_state='timeout',
+                             status='剩余时间不足以请求模型，请立即手动作答')
             return
-        self.add_message('%s题目已收到，模型正在后台生成建议' % self.lessonname, 0)
+
         def on_retry(message):
-            if not review.event.is_set() and review.llm_state in ('processing', 'retrying') and time.monotonic() < review.llm_deadline:
-                review.set_state(llm_state='retrying', status=message)
+            if active() and time.monotonic() < deadline:
+                review.set_state(question_revision=question_revision, while_processing=True,
+                                 llm_state='retrying', status=message)
+
         try:
-            result = bounded_call(lambda: ask_llm(problem, problemtype, llm_cfg,
-                time_budget=budget, on_retry=on_retry, return_details=True), budget)
-            if not self._running() or review.event.is_set():
+            result = bounded_call(lambda: ask_llm(problem, problemtype, llm_cfg, time_budget=budget,
+                on_retry=on_retry, return_details=True, active=active), budget)
+            if not active():
                 return
             details = result if isinstance(result, dict) else {'answers': result}
             if not details.get('answers'):
                 raise RuntimeError('模型未返回有效答案，返回格式异常')
-            if time.monotonic() >= review.llm_deadline:
+            if time.monotonic() >= deadline:
                 raise requests.Timeout('模型整体等待超时')
             lower = max(1, int(self.config.get('answer_delay_min', self.config.get('answer_review_seconds', 15))))
             upper = max(lower, int(self.config.get('answer_delay_max', lower)))
-            seconds = review_seconds(limit, time.monotonic() - review.started, random.randint(lower, upper))
-            review.apply_model(details, revision, seconds)
-            self.main_ui.metrics_signal.emit({'result': details})
+            seconds = review_seconds(review.limit, time.monotonic() - review.started, random.randint(lower, upper))
+            if review.apply_model(details, revision, seconds, question_revision=question_revision):
+                self.main_ui.metrics_signal.emit({'result': details})
         except Exception as error:
-            if review.event.is_set() or not self._running():
+            if not active():
                 return
             kind, message = classify_error(error)
-            review.set_state(llm_state='timeout' if kind == 'timeout' else 'failed',
-                llm_error=message, status=message)
+            state = {'timeout': 'timeout', 'image': 'image_unavailable',
+                     'image_unreadable': 'image_unreadable'}.get(kind, 'failed')
+            if not review.set_state(question_revision=question_revision, llm_state=state,
+                                    llm_error=message, status=message):
+                return
             self.main_ui.metrics_signal.emit({'unknown': 1})
             self.add_message('%s：%s' % (self.lessonname, message), 4)
+            if isinstance(error, ImageLoadError):
+                self._request_missing_images(review, question_revision)
+
+    def _request_missing_images(self, review, question_revision):
+        socket = getattr(self, 'wsapp', None)
+        with review.lock:
+            if (socket is None or review.event.is_set() or review.image_refresh_requested
+                    or review.question_revision != question_revision):
+                return
+            review.image_refresh_requested = True
+        try:
+            self._current_problem(socket, review.problem_id)
+        except (OSError, websocket.WebSocketException):
+            pass
 
     def _start_model(self, review):
         with review.lock:
+            question_revision = review.question_revision
             if (not self._running() or review.event.is_set() or not review.can_answer
-                    or getattr(review, '_model_running', False)):
+                    or review.model_running_revision == question_revision):
                 return
-            review._model_running = True
+            review.model_running_revision = question_revision
+            problem, problemtype = review.problem, review.problemtype
+
         def work():
             try:
-                self._answer_by_llm(review.problem, review.problem_id, review.problemtype, review.limit, review)
+                self._answer_by_llm(review, problem, problemtype, question_revision)
             finally:
                 with review.lock:
-                    review._model_running = False
+                    if review.model_running_revision == question_revision:
+                        review.model_running_revision = None
         threading.Thread(target=work, daemon=True).start()
 
     def _wait_review(self, review):
@@ -396,36 +406,57 @@ class Lesson:
             elapsed=time.monotonic() - review.started, immediate=True)
 
     def _refresh_question(self, review, pushed):
-        if review.event.is_set():
-            return
-        problem = self._extract_problem(pushed, review.problem_id)
-        # 新报文可能只有 id，不得擦除先前已经收到的题干。
-        for key, value in review.problem.items():
-            if not problem.get(key):
-                problem[key] = value
-        try:
-            problemtype = int(problem.get('problemType'))
-        except (ValueError, TypeError):
-            problemtype = None
-        has_content = bool(problem.get('body') or problem.get('content') or problem.get('title') or problem.get('images') or problem.get('options'))
-        can_answer = (problemtype in (1, 2, 4, 5) and has_content and review.time_known
-                      and not review.problem_id.startswith('unknown:'))
-        if problemtype in (1, 2) and not problem.get('options'):
-            can_answer = False
-        was_ready = review.can_answer
-        review.set_state(problem=problem, problemtype=problemtype, can_answer=can_answer,
-            llm_state=review.llm_state if can_answer else 'not_requested',
-            status='已收到题目，可立即作答' if can_answer else (
-                '已收到题目，但缺少有效截止时间，请在雨课堂核对' if not review.time_known else
-                '已收到题目，题型暂不支持，请到雨课堂处理' if problemtype not in (None, 1, 2, 4, 5) else
-                '已收到题目，题面或选项未获取完整，可重新获取'))
-        if can_answer and not was_ready:
+        with review.lock:
+            if review.event.is_set():
+                return
+            problem = self._extract_problem(pushed, review.problem_id, previous=review.problem)
+            try:
+                problemtype = int(problem.get('problemType'))
+            except (ValueError, TypeError):
+                problemtype = None
+            has_content = any(problem.get(key) for key in ('body', 'images', 'options'))
+            can_answer = (problemtype in (1, 2, 4, 5) and has_content and review.time_known
+                          and not review.problem_id.startswith('unknown:'))
+            if problemtype in (1, 2) and not problem.get('options'):
+                can_answer = False
+            was_ready = review.can_answer
+            changed = problem != review.problem
+            if was_ready and can_answer and not changed:
+                return
+
+            images_changed = changed and image_signature(review.problem) != image_signature(problem)
+            replace_suggestion = was_ready and (images_changed or not can_answer)
+            review.problem = problem
+            review.problemtype = problemtype
+            review.can_answer = can_answer
+            if replace_suggestion:
+                review.question_revision += 1
+                review.result = {}
+                review.auto_submit = False
+                review.llm_started = review.llm_deadline = None
+                if review.revision == 0:
+                    review.answers = []
+                    review.valid_input = False
+            if not can_answer:
+                review.llm_state = 'not_requested'
+                review.status = (
+                    '已收到题目，但缺少有效截止时间，请在雨课堂核对' if not review.time_known else
+                    '已收到题目，题型暂不支持，请到雨课堂处理' if problemtype not in (None, 1, 2, 4, 5) else
+                    '已收到题目，题面或选项未获取完整，可重新获取')
+            elif not was_ready or replace_suggestion:
+                review.llm_state = 'pending'
+                review.llm_error = ''
+                review.status = '已补全题目图片，准备重新作答' if replace_suggestion else '已收到题目，可立即作答'
+        review.persist()
+        if can_answer and (not was_ready or replace_suggestion):
             self._start_model(review)
 
     def _retry_question(self, review):
         if review.event.is_set() or not self._running():
             return
-        review.set_state(status='已收到题目，正在重新获取题面')
+        retries_image = review.llm_state == 'image_unavailable'
+        question_revision = review.question_revision
+        review.set_state(question_revision=question_revision, status='已收到题目，正在重新获取题面')
         try:
             if getattr(self, 'wsapp', None) is not None:
                 self._current_problem(self.wsapp, review.problem_id)
@@ -433,9 +464,13 @@ class Lesson:
                 self._cache_problems(presentationid)
             self._refresh_question(review, {})
             if not review.can_answer:
-                review.set_state(status='已收到题目，题面仍未完整，请稍后重试或在雨课堂查看')
+                review.set_state(question_revision=question_revision,
+                                 status='已收到题目，题面仍未完整，请稍后重试或在雨课堂查看')
+            elif retries_image and review.question_revision == question_revision:
+                self._start_model(review)
         except Exception:
-            review.set_state(status='已收到题目，题面重新获取失败，请检查网络后重试')
+            review.set_state(question_revision=question_revision,
+                             status='已收到题目，题面重新获取失败，请检查网络后重试')
 
     def start_answer(self, problemid, limit, problem=None):
         # 所有入口先记录接收事实，之后才决定是否能够调用模型。
@@ -452,8 +487,7 @@ class Lesson:
                 existing.limit = limit
                 existing.started = time.monotonic()
                 existing.question_deadline = None if limit == -1 else existing.started + limit
-            if not existing.can_answer:
-                self._refresh_question(existing, problem or {})
+            self._refresh_question(existing, problem or {})
             return existing
         extracted = self._extract_problem(problem or {}, problemid)
         try:
